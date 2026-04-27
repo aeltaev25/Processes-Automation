@@ -1,0 +1,291 @@
+"""
+routes/hotels.py
+─────────────────
+Hotel department workflow:
+  1. Staff creates a hotel request for a booking.
+  2. System sends request to hotel (Email or Telegram).
+  3. Hotel replies: BOOKED → confirmed | NO_ROOMS → create new request (next hotel).
+  4. 45 days before check-in → auto-confirmation sent (by scheduler, also manually here).
+  5. Post-stay: act received → price verified → marked for accounting.
+
+Endpoints:
+  GET    /api/hotels                           → list hotels catalogue
+  POST   /api/hotels                           → add hotel to catalogue
+  GET    /api/bookings/<id>/hotel-requests     → list hotel requests for booking
+  POST   /api/bookings/<id>/hotel-requests     → create new hotel request (send to hotel)
+  PATCH  /api/hotel-requests/<id>/reply        → record hotel reply (booked / no rooms)
+  POST   /api/hotel-requests/<id>/confirm-45   → manually trigger 45-day confirmation
+  PATCH  /api/hotel-requests/<id>/act          → record post-stay act + price verification
+"""
+
+import logging
+from datetime import datetime
+
+from flask  import Blueprint, request
+from models import (db, Hotel, HotelRequest, TourBooking, AuditLog,
+                    HotelRequestStatus, BookingStatus)
+from utils  import (require_json, success_response, error_response,
+                    validate_date, paginate)
+from services.notifications import NotificationService
+
+logger = logging.getLogger(__name__)
+bp     = Blueprint("hotels", __name__, url_prefix="/api")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HOTEL CATALOGUE
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/hotels", methods=["GET"])
+def list_hotels():
+    hotels = Hotel.query.filter_by(is_active=True).order_by(Hotel.name).all()
+    return success_response(data=[h.to_dict() for h in hotels])
+
+
+@bp.route("/hotels", methods=["POST"])
+@require_json("name")
+def create_hotel():
+    data = request.get_json()
+    hotel = Hotel(
+        name             = data["name"].strip(),
+        city             = data.get("city", "").strip() or None,
+        stars            = data.get("stars"),
+        contact_email    = data.get("contact_email", "").strip() or None,
+        contact_phone    = data.get("contact_phone", "").strip() or None,
+        telegram_contact = data.get("telegram_contact", "").strip() or None,
+    )
+    db.session.add(hotel)
+    db.session.commit()
+    return success_response(data=hotel.to_dict(), message="Hotel added.", status_code=201)
+
+
+@bp.route("/hotels/<int:hotel_id>", methods=["PATCH"])
+def update_hotel(hotel_id):
+    hotel = Hotel.query.get_or_404(hotel_id)
+    data  = request.get_json(silent=True) or {}
+    for field in ("name", "city", "stars", "contact_email", "contact_phone",
+                  "telegram_contact", "is_active"):
+        if field in data:
+            setattr(hotel, field, data[field])
+    db.session.commit()
+    return success_response(data=hotel.to_dict())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HOTEL REQUESTS (per booking)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/bookings/<int:booking_id>/hotel-requests", methods=["GET"])
+def list_hotel_requests(booking_id):
+    TourBooking.query.get_or_404(booking_id)   # 404 if booking doesn't exist
+    reqs = (
+        HotelRequest.query
+        .filter_by(booking_id=booking_id)
+        .order_by(HotelRequest.attempt_number)
+        .all()
+    )
+    return success_response(data=[r.to_dict() for r in reqs])
+
+
+@bp.route("/bookings/<int:booking_id>/hotel-requests", methods=["POST"])
+@require_json("hotel_id", "check_in", "check_out", "num_rooms")
+def create_hotel_request(booking_id):
+    """
+    Staff sends a request to a hotel for availability.
+    The system records the request and notifies the hotel department via Telegram.
+    If a previous request exists (no_rooms), this becomes attempt N+1.
+    """
+    booking = TourBooking.query.get_or_404(booking_id)
+    data    = request.get_json()
+
+    hotel   = Hotel.query.get(data["hotel_id"])
+    if not hotel:
+        return error_response("Hotel not found.", 404)
+
+    check_in  = validate_date(data.get("check_in"))
+    check_out = validate_date(data.get("check_out"))
+    if not check_in or not check_out:
+        return error_response("check_in and check_out must be valid dates (YYYY-MM-DD).", 422)
+    if check_out <= check_in:
+        return error_response("check_out must be after check_in.", 422)
+
+    # Determine attempt number
+    attempt = (
+        HotelRequest.query
+        .filter_by(booking_id=booking_id)
+        .count()
+    ) + 1
+
+    hr = HotelRequest(
+        booking_id       = booking.id,
+        hotel_id         = hotel.id,
+        attempt_number   = attempt,
+        hotel_name       = hotel.name,
+        room_type        = data.get("room_type", "standard"),
+        check_in         = check_in,
+        check_out        = check_out,
+        num_rooms        = int(data["num_rooms"]),
+        price_per_night  = data.get("price_per_night"),
+        request_sent_via = data.get("request_sent_via", "email"),
+        request_sent_at  = datetime.utcnow(),
+        status           = HotelRequestStatus.PENDING,
+        notes            = data.get("notes"),
+    )
+    # Calculate total price
+    if hr.price_per_night:
+        nights = (check_out - check_in).days
+        hr.total_price = float(hr.price_per_night) * nights * hr.num_rooms
+
+    db.session.add(hr)
+    db.session.flush()
+
+    AuditLog.log("hotel_request", hr.id, "created",
+                 new_value=HotelRequestStatus.PENDING,
+                 performed_by=data.get("created_by", "staff"))
+    db.session.commit()
+
+    # Notify hotel department
+    try:
+        NotificationService.hotel_request_sent(booking, hr)
+    except Exception as exc:
+        logger.warning(f"[Hotel] TG notification failed: {exc}")
+
+    return success_response(
+        data=hr.to_dict(),
+        message=f"Hotel request #{hr.id} created (attempt {attempt}).",
+        status_code=201
+    )
+
+
+@bp.route("/hotel-requests/<int:req_id>/reply", methods=["PATCH"])
+@require_json("reply")
+def record_hotel_reply(req_id):
+    """
+    Record the hotel's reply: 'booked' or 'no_rooms'.
+    • booked   → update status, record confirmation code.
+    • no_rooms → update status, notify team to try next hotel.
+    """
+    hr   = HotelRequest.query.get_or_404(req_id)
+    data = request.get_json()
+    reply = data.get("reply", "").lower()
+
+    if reply not in ("booked", "no_rooms"):
+        return error_response("reply must be 'booked' or 'no_rooms'.", 422)
+
+    old_status = hr.status
+    hr.reply_received_at = datetime.utcnow()
+
+    if reply == "booked":
+        hr.status            = HotelRequestStatus.BOOKED
+        hr.confirmation_code = data.get("confirmation_code", "").strip() or None
+        AuditLog.log("hotel_request", hr.id, "reply_booked",
+                     old_value=old_status, new_value=HotelRequestStatus.BOOKED)
+        db.session.commit()
+        try:
+            NotificationService.hotel_booked(hr.booking, hr)
+        except Exception as exc:
+            logger.warning(f"[Hotel] Booked notification failed: {exc}")
+        return success_response(data=hr.to_dict(), message="Hotel confirmed! ✅")
+
+    else:  # no_rooms
+        hr.status = HotelRequestStatus.NO_ROOMS
+        AuditLog.log("hotel_request", hr.id, "reply_no_rooms",
+                     old_value=old_status, new_value=HotelRequestStatus.NO_ROOMS)
+        db.session.commit()
+        try:
+            NotificationService.hotel_no_rooms(hr.booking, hr)
+        except Exception as exc:
+            logger.warning(f"[Hotel] No-rooms notification failed: {exc}")
+        return success_response(
+            data=hr.to_dict(),
+            message="No rooms — please create a new request for the next hotel."
+        )
+
+
+@bp.route("/hotel-requests/<int:req_id>/confirm-45", methods=["POST"])
+def send_45day_confirmation(req_id):
+    """
+    Manually trigger the 45-day pre-tour confirmation email to the hotel.
+    The scheduler does this automatically but staff can also trigger it here.
+    """
+    hr = HotelRequest.query.get_or_404(req_id)
+    if hr.status != HotelRequestStatus.BOOKED:
+        return error_response("Only BOOKED hotel requests can be confirmed.", 409)
+    if hr.confirm_sent_at:
+        return error_response(
+            f"Confirmation already sent at {hr.confirm_sent_at.isoformat()}.", 409
+        )
+
+    sent = NotificationService.hotel_45day_confirmation(hr.booking, hr)
+    if not sent:
+        return error_response("Failed to send confirmation email. Check hotel email.", 500)
+
+    hr.confirm_sent_at = datetime.utcnow()
+    AuditLog.log("hotel_request", hr.id, "45day_confirmation_sent", performed_by="staff")
+    db.session.commit()
+
+    # Also update booking status to IN_PROGRESS if not already
+    if hr.booking.status == BookingStatus.CONFIRMED:
+        hr.booking.status                  = BookingStatus.IN_PROGRESS
+        hr.booking.to_confirmation_sent_at = datetime.utcnow()
+
+    db.session.commit()
+    return success_response(message="45-day confirmation email sent to hotel. ✅")
+
+
+@bp.route("/hotel-requests/<int:req_id>/act", methods=["PATCH"])
+def record_hotel_act(req_id):
+    """
+    Post-stay: record the act (invoice) received from the hotel and
+    verify the price matches what was agreed.
+
+    Payload:
+      act_amount       — amount on the act
+      price_verified   — bool: does it match agreed price?
+      dispute_notes    — if price_verified=false, explain why
+    """
+    hr   = HotelRequest.query.get_or_404(req_id)
+    data = request.get_json(silent=True) or {}
+
+    hr.act_received   = True
+    hr.act_received_at= datetime.utcnow()
+    hr.act_amount     = data.get("act_amount")
+    hr.price_verified = bool(data.get("price_verified", False))
+    if data.get("notes"):
+        hr.notes = data["notes"]
+
+    AuditLog.log(
+        "hotel_request", hr.id,
+        "act_received",
+        new_value=f"amount={hr.act_amount}, verified={hr.price_verified}",
+        performed_by=data.get("performed_by", "staff")
+    )
+
+    # Update accounting record costs
+    accounting = hr.booking.accounting
+    if accounting and hr.act_amount:
+        accounting.hotel_cost = float(hr.act_amount)
+        accounting.recalculate()
+
+    db.session.commit()
+
+    if not hr.price_verified and data.get("dispute_notes"):
+        # Create an invoice record in disputed state
+        from models import Invoice, InvoiceStatus
+        inv = Invoice(
+            accounting_id = accounting.id if accounting else None,
+            supplier_type = "hotel",
+            supplier_name = hr.hotel_name,
+            amount        = hr.act_amount,
+            status        = InvoiceStatus.PRICE_DISPUTE,
+            dispute_notes = data.get("dispute_notes"),
+        )
+        db.session.add(inv)
+        db.session.commit()
+        try:
+            NotificationService.invoice_price_dispute(inv)
+        except Exception as exc:
+            logger.warning(f"[Hotel] Price dispute notification failed: {exc}")
+        return success_response(message="Act recorded — price dispute flagged. ⚠️")
+
+    return success_response(data=hr.to_dict(), message="Act recorded and price verified. ✅")

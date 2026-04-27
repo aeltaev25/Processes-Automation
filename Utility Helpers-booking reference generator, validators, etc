@@ -1,0 +1,124 @@
+"""
+utils.py — Shared utilities for the Tour CRM.
+"""
+
+import re
+import logging
+from datetime    import datetime
+from functools   import wraps
+from flask       import request, jsonify
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOOKING REFERENCE GENERATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_booking_ref(db_session) -> str:
+    """
+    Generate a unique, human-readable booking reference: TB-YYYY-NNNN
+    Uses the current highest id to avoid DB round-trips in most cases.
+    """
+    from models import TourBooking
+    year  = datetime.utcnow().year
+    count = db_session.query(TourBooking).count() + 1
+    return f"TB-{year}-{count:04d}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REQUEST VALIDATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def require_json(*required_fields):
+    """
+    Decorator factory.
+    Usage:  @require_json("name", "email")
+    Returns 400 if the request body is not JSON or missing required fields.
+    """
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            data = request.get_json(silent=True)
+            if data is None:
+                return jsonify({"success": False, "error": "Request body must be JSON."}), 400
+            missing = [f for f in required_fields if not data.get(f)]
+            if missing:
+                return jsonify({
+                    "success": False,
+                    "error": f"Missing required fields: {', '.join(missing)}"
+                }), 400
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def validate_email(email: str) -> bool:
+    pattern = r"^[\w\.\+\-]+@[\w\-]+\.[a-zA-Z]{2,}$"
+    return bool(re.match(pattern, email))
+
+
+def validate_date(date_str: str):
+    """Parse a date string (YYYY-MM-DD). Returns a date object or None."""
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESPONSE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def success_response(data=None, message="OK", status_code=200):
+    payload = {"success": True, "message": message}
+    if data is not None:
+        payload["data"] = data
+    return jsonify(payload), status_code
+
+
+def error_response(message: str, status_code: int = 400, details=None):
+    payload = {"success": False, "error": message}
+    if details:
+        payload["details"] = details
+    return jsonify(payload), status_code
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGINATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def paginate(query, page: int = 1, per_page: int = 20):
+    """
+    Apply pagination to an SQLAlchemy query.
+    Returns a dict suitable for a JSON response.
+    """
+    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+    return {
+        "items":    [item.to_dict() for item in pagination.items],
+        "total":    pagination.total,
+        "page":     pagination.page,
+        "pages":    pagination.pages,
+        "per_page": pagination.per_page,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def days_until(target_date) -> int:
+    """Returns number of calendar days until target_date from today."""
+    from datetime import date
+    return (target_date - date.today()).days
+
+
+def serialize_date(d) -> str:
+    """Safely convert date/datetime to ISO string."""
+    if d is None:
+        return None
+    if hasattr(d, "isoformat"):
+        return d.isoformat()
+    return str(d)

@@ -1,0 +1,284 @@
+"""
+routes/leads.py
+────────────────
+Step 1 — Lead intake from the website contact / tour-request form.
+Step 2 — Convert lead → TourBooking (sales agent action).
+
+Endpoints:
+  POST /api/leads                  → submit tour request from website
+  GET  /api/leads                  → list all leads (CRM view)
+  GET  /api/leads/<id>             → single lead detail
+  PATCH /api/leads/<id>/status     → update lead status / assign agent
+  POST /api/leads/<id>/convert     → convert lead to a TourBooking
+  GET  /api/bookings               → list all bookings
+  GET  /api/bookings/<id>          → booking detail (full dashboard)
+  PATCH /api/bookings/<id>/status  → update booking status
+  POST /api/bookings/<id>/services-rendered → mark tour as completed
+"""
+
+import logging
+from datetime import datetime
+
+from flask     import Blueprint, request
+from models    import db, Lead, TourBooking, AccountingRecord, AuditLog, LeadStatus, BookingStatus
+from utils     import (require_json, success_response, error_response,
+                       validate_email, validate_date, generate_booking_ref, paginate)
+from services.notifications import NotificationService
+
+logger = logging.getLogger(__name__)
+bp     = Blueprint("leads", __name__, url_prefix="/api")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LEADS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/leads", methods=["POST"])
+@require_json("name", "email", "message")
+def submit_lead():
+    """
+    Public-facing endpoint — called from the website tour-request form.
+    Validates input → saves to DB → sends auto-reply to client
+    → notifies sales team via Telegram.
+    """
+    data = request.get_json()
+
+    # ── Validation ────────────────────────────────────────────────────────────
+    email = data.get("email", "").strip().lower()
+    if not validate_email(email):
+        return error_response("Invalid email address.", 422)
+
+    arrival   = validate_date(data.get("arrival_date"))
+    departure = validate_date(data.get("departure_date"))
+    if arrival and departure and departure <= arrival:
+        return error_response("departure_date must be after arrival_date.", 422)
+
+    # ── Create lead ───────────────────────────────────────────────────────────
+    lead = Lead(
+        name          = data.get("name",        "").strip(),
+        email         = email,
+        phone         = data.get("phone",       "").strip() or None,
+        country       = data.get("country",     "").strip() or None,
+        language      = data.get("language",    "").strip() or None,
+        tour_type     = data.get("tour_type",   "").strip() or None,
+        destination   = data.get("destination", "").strip() or None,
+        pax           = int(data.get("pax", 1)),
+        arrival_date  = arrival,
+        departure_date= departure,
+        message       = data.get("message", "").strip(),
+        source        = data.get("source", "website"),
+        status        = LeadStatus.NEW,
+    )
+    db.session.add(lead)
+    db.session.flush()   # get ID before commit
+
+    AuditLog.log("lead", lead.id, "created", new_value=LeadStatus.NEW, performed_by="website")
+    db.session.commit()
+
+    logger.info(f"[Lead] #{lead.id} created — {lead.name} <{lead.email}>")
+
+    # ── Notifications (fire-and-forget, don't block response) ────────────────
+    try:
+        NotificationService.lead_received_client(lead)
+    except Exception as exc:
+        logger.warning(f"[Lead] Auto-reply failed: {exc}")
+    try:
+        NotificationService.lead_received_sales(lead)
+    except Exception as exc:
+        logger.warning(f"[Lead] Sales TG notification failed: {exc}")
+
+    return success_response(
+        data={"lead_id": lead.id},
+        message="Thank you! Our team will contact you within 24 hours.",
+        status_code=201
+    )
+
+
+@bp.route("/leads", methods=["GET"])
+def list_leads():
+    """List leads with optional filters. For internal CRM use."""
+    status = request.args.get("status")
+    source = request.args.get("source")
+    search = request.args.get("q")
+
+    query = Lead.query.order_by(Lead.created_at.desc())
+    if status:
+        query = query.filter(Lead.status == status)
+    if source:
+        query = query.filter(Lead.source == source)
+    if search:
+        like = f"%{search}%"
+        query = query.filter(
+            (Lead.name.ilike(like)) | (Lead.email.ilike(like)) | (Lead.destination.ilike(like))
+        )
+
+    page     = int(request.args.get("page", 1))
+    per_page = int(request.args.get("per_page", 25))
+    return success_response(data=paginate(query, page, per_page))
+
+
+@bp.route("/leads/<int:lead_id>", methods=["GET"])
+def get_lead(lead_id):
+    lead = Lead.query.get_or_404(lead_id)
+    data = lead.to_dict()
+    if lead.booking:
+        data["booking_ref"] = lead.booking.booking_ref
+    return success_response(data=data)
+
+
+@bp.route("/leads/<int:lead_id>/status", methods=["PATCH"])
+def update_lead_status(lead_id):
+    lead = Lead.query.get_or_404(lead_id)
+    data = request.get_json(silent=True) or {}
+    old  = lead.status
+
+    if "status" in data:
+        lead.status = data["status"]
+    if "assigned_to" in data:
+        lead.assigned_to = data["assigned_to"]
+    if "notes" in data:
+        lead.notes = data.get("notes")
+
+    AuditLog.log("lead", lead.id, "status_updated",
+                 old_value=old, new_value=lead.status,
+                 performed_by=data.get("performed_by", "staff"))
+    db.session.commit()
+    return success_response(message="Lead updated.", data=lead.to_dict())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONVERT LEAD → BOOKING
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/leads/<int:lead_id>/convert", methods=["POST"])
+def convert_lead(lead_id):
+    """
+    Sales agent action: convert a confirmed lead into a TourBooking.
+    Automatically creates an AccountingRecord shell.
+    The lead status moves to 'converted'.
+    """
+    lead = Lead.query.get_or_404(lead_id)
+    if lead.booking:
+        return error_response(
+            f"Lead #{lead_id} is already converted to booking {lead.booking.booking_ref}.", 409
+        )
+
+    data          = request.get_json(silent=True) or {}
+    booking_ref   = generate_booking_ref(db.session)
+    arrival       = validate_date(data.get("arrival_date")) or lead.arrival_date
+    departure     = validate_date(data.get("departure_date")) or lead.departure_date
+
+    if not arrival or not departure:
+        return error_response("arrival_date and departure_date are required for conversion.", 422)
+
+    # ── Create TourBooking ────────────────────────────────────────────────────
+    booking = TourBooking(
+        lead_id        = lead.id,
+        booking_ref    = booking_ref,
+        client_name    = data.get("client_name",  lead.name),
+        client_email   = data.get("client_email", lead.email),
+        client_phone   = data.get("client_phone", lead.phone),
+        pax            = int(data.get("pax", lead.pax or 1)),
+        arrival_date   = arrival,
+        departure_date = departure,
+        destination    = data.get("destination", lead.destination),
+        tour_type      = data.get("tour_type",   lead.tour_type),
+        language       = data.get("language",    lead.language),
+        total_price    = float(data.get("total_price", 0)),
+        currency       = data.get("currency", "USD"),
+        status         = BookingStatus.CONFIRMED,
+        excel_row_ref  = data.get("excel_row_ref"),
+        created_by     = data.get("created_by", "sales"),
+    )
+    db.session.add(booking)
+    db.session.flush()
+
+    # ── Create AccountingRecord shell ─────────────────────────────────────────
+    accounting = AccountingRecord(
+        booking_id   = booking.id,
+        quoted_price = booking.total_price,
+        currency     = booking.currency,
+    )
+    db.session.add(accounting)
+
+    # ── Update lead status ────────────────────────────────────────────────────
+    lead.status = LeadStatus.CONVERTED
+    AuditLog.log("lead",         lead.id,    "converted",      new_value=booking_ref, performed_by=data.get("created_by","staff"))
+    AuditLog.log("tour_booking", booking.id, "created",        new_value=BookingStatus.CONFIRMED, performed_by=data.get("created_by","staff"))
+    AuditLog.log("accounting",   booking.id, "record_created", new_value="open")
+    db.session.commit()
+
+    logger.info(f"[Booking] {booking_ref} created from Lead #{lead_id}")
+    return success_response(
+        data={"booking_ref": booking_ref, "booking_id": booking.id},
+        message=f"Booking {booking_ref} created successfully.",
+        status_code=201
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOOKINGS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/bookings", methods=["GET"])
+def list_bookings():
+    status  = request.args.get("status")
+    query   = TourBooking.query.order_by(TourBooking.arrival_date.asc())
+    if status:
+        query = query.filter(TourBooking.status == status)
+    page     = int(request.args.get("page", 1))
+    per_page = int(request.args.get("per_page", 25))
+    return success_response(data=paginate(query, page, per_page))
+
+
+@bp.route("/bookings/<int:booking_id>", methods=["GET"])
+def get_booking(booking_id):
+    """
+    Full booking dashboard — returns the booking plus all linked departments.
+    """
+    b = TourBooking.query.get_or_404(booking_id)
+    data = b.to_dict()
+    data["hotel_requests"]        = [r.to_dict() for r in b.hotel_requests]
+    data["restaurant_requests"]   = [r.to_dict() for r in b.restaurant_requests]
+    data["transport_assignments"]  = [r.to_dict() for r in b.transport_assignments]
+    data["guide_assignments"]     = [r.to_dict() for r in b.guide_assignments]
+    data["railway_tickets"]       = [r.to_dict() for r in b.railway_tickets]
+    data["aviation_tickets"]      = [r.to_dict() for r in b.aviation_tickets]
+    data["accounting"]            = b.accounting.to_dict() if b.accounting else None
+    return success_response(data=data)
+
+
+@bp.route("/bookings/<int:booking_id>/status", methods=["PATCH"])
+def update_booking_status(booking_id):
+    booking = TourBooking.query.get_or_404(booking_id)
+    data    = request.get_json(silent=True) or {}
+    old     = booking.status
+    new_status = data.get("status")
+    if new_status:
+        booking.status = new_status
+        if new_status == BookingStatus.IN_PROGRESS:
+            booking.to_confirmation_sent_at = booking.to_confirmation_sent_at or datetime.utcnow()
+    AuditLog.log("tour_booking", booking.id, "status_changed",
+                 old_value=old, new_value=booking.status,
+                 performed_by=data.get("performed_by", "staff"))
+    db.session.commit()
+    return success_response(data=booking.to_dict(), message="Booking status updated.")
+
+
+@bp.route("/bookings/<int:booking_id>/services-rendered", methods=["POST"])
+def mark_services_rendered(booking_id):
+    """
+    Mark that the tour has ended and all services have been delivered.
+    Triggers the invoice collection / final accounting phase.
+    """
+    booking = TourBooking.query.get_or_404(booking_id)
+    data    = request.get_json(silent=True) or {}
+
+    booking.services_rendered = True
+    booking.status            = BookingStatus.COMPLETED
+
+    AuditLog.log("tour_booking", booking.id, "services_rendered",
+                 performed_by=data.get("performed_by", "staff"))
+    db.session.commit()
+    logger.info(f"[Booking] {booking.booking_ref} — services marked as rendered.")
+    return success_response(message="Services marked as rendered. Invoice collection phase begins.")

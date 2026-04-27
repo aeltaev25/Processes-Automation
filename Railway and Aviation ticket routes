@@ -1,0 +1,352 @@
+"""
+routes/tickets.py
+──────────────────
+Two ticket departments:
+
+  A) RAILWAY (UzRailways / Temiryo'l Express)
+     POST /api/bookings/<id>/railway-tickets       → create ticket need
+     PATCH /api/railway-tickets/<id>/purchase      → record purchase / waitlist
+     POST  /api/railway-tickets/<id>/issue         → issue ticket + send to client
+     PATCH /api/railway-tickets/<id>/act           → record Temiryo'l act + reconcile
+
+  B) AVIATION
+     POST /api/bookings/<id>/aviation-tickets      → create flight booking need
+     PATCH /api/aviation-tickets/<id>/purchase     → book / waitlist
+     POST  /api/aviation-tickets/<id>/45day-check  → manually check at 45-day mark
+     POST  /api/aviation-tickets/<id>/issue        → issue + send to client
+     PATCH /api/aviation-tickets/<id>/act          → aviation kassa act + reconcile
+"""
+
+import logging
+from datetime import datetime
+
+from flask  import Blueprint, request
+from models import (db, RailwayTicket, AviationTicket, TourBooking,
+                    AuditLog, TicketStatus, Invoice, InvoiceStatus)
+from utils  import (require_json, success_response, error_response, validate_date)
+from services.notifications import NotificationService
+
+logger = logging.getLogger(__name__)
+bp     = Blueprint("tickets", __name__, url_prefix="/api")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A) RAILWAY TICKETS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bp.route("/bookings/<int:booking_id>/railway-tickets", methods=["GET"])
+def list_railway_tickets(booking_id):
+    TourBooking.query.get_or_404(booking_id)
+    tickets = RailwayTicket.query.filter_by(booking_id=booking_id).all()
+    return success_response(data=[t.to_dict() for t in tickets])
+
+
+@bp.route("/bookings/<int:booking_id>/railway-tickets", methods=["POST"])
+@require_json("passenger_name", "route_from", "route_to", "travel_date")
+def create_railway_ticket(booking_id):
+    """Register a railway ticket requirement for a traveller."""
+    booking = TourBooking.query.get_or_404(booking_id)
+    data    = request.get_json()
+    travel_date = validate_date(data.get("travel_date"))
+    if not travel_date:
+        return error_response("travel_date must be a valid date (YYYY-MM-DD).", 422)
+
+    ticket = RailwayTicket(
+        booking_id      = booking.id,
+        passenger_name  = data["passenger_name"].strip(),
+        passport_number = data.get("passport_number", "").strip() or None,
+        route_from      = data["route_from"].strip(),
+        route_to        = data["route_to"].strip(),
+        travel_date     = travel_date,
+        train_number    = data.get("train_number", "").strip() or None,
+        seat_class      = data.get("seat_class", "economy"),
+        price           = data.get("price"),
+        status          = TicketStatus.NOT_PURCHASED,
+        notes           = data.get("notes"),
+    )
+    db.session.add(ticket)
+    db.session.flush()
+    AuditLog.log("railway_ticket", ticket.id, "created",
+                 new_value=TicketStatus.NOT_PURCHASED,
+                 performed_by=data.get("created_by", "staff"))
+    db.session.commit()
+    return success_response(data=ticket.to_dict(), status_code=201,
+                            message="Railway ticket requirement created.")
+
+
+@bp.route("/railway-tickets/<int:ticket_id>/purchase", methods=["PATCH"])
+@require_json("purchased_on_site")
+def purchase_railway_ticket(ticket_id):
+    """
+    Record the purchase attempt:
+    - purchased_on_site=True → ticket available on UzRailways website, bought directly.
+    - purchased_on_site=False → send manual request to UzRailways.
+    """
+    ticket = RailwayTicket.query.get_or_404(ticket_id)
+    data   = request.get_json()
+    on_site = bool(data.get("purchased_on_site"))
+
+    ticket.purchased_on_site = on_site
+    if on_site:
+        ticket.status        = TicketStatus.PURCHASED
+        ticket.ticket_number = data.get("ticket_number", "").strip() or None
+        ticket.price         = data.get("price", ticket.price)
+        AuditLog.log("railway_ticket", ticket.id, "purchased_on_site")
+        db.session.commit()
+        return success_response(data=ticket.to_dict(),
+                                message="Ticket purchased on UzRailways website. ✅")
+    else:
+        ticket.uzrailways_request_sent = True
+        ticket.uzrailways_request_at   = datetime.utcnow()
+        ticket.status                  = TicketStatus.WAITLISTED
+        AuditLog.log("railway_ticket", ticket.id, "manual_request_sent")
+        db.session.commit()
+        return success_response(data=ticket.to_dict(),
+                                message="Manual request sent to UzRailways — awaiting response.")
+
+
+@bp.route("/railway-tickets/<int:ticket_id>/issue", methods=["POST"])
+@require_json("ticket_number")
+def issue_railway_ticket(ticket_id):
+    """
+    Issue the ticket (enter ticket number + optional file path)
+    and mark it as sent to the client / tour operator.
+    """
+    ticket = RailwayTicket.query.get_or_404(ticket_id)
+    data   = request.get_json()
+
+    ticket.ticket_number  = data["ticket_number"].strip()
+    ticket.ticket_file    = data.get("ticket_file")
+    ticket.status         = TicketStatus.SENT_TO_CLIENT
+    ticket.sent_to_client = True
+    ticket.sent_to_client_at = datetime.utcnow()
+    ticket.excel_row_ref  = data.get("excel_row_ref", ticket.excel_row_ref)
+
+    AuditLog.log("railway_ticket", ticket.id, "issued_and_sent",
+                 new_value=ticket.ticket_number,
+                 performed_by=data.get("performed_by", "staff"))
+    db.session.commit()
+
+    # Update accounting
+    accounting = ticket.booking.accounting
+    if accounting and ticket.price:
+        current = float(accounting.railway_cost or 0)
+        accounting.railway_cost = current + float(ticket.price)
+        accounting.recalculate()
+        db.session.commit()
+
+    return success_response(data=ticket.to_dict(),
+                            message="Ticket issued and sent to client/TO. ✅")
+
+
+@bp.route("/railway-tickets/<int:ticket_id>/act", methods=["PATCH"])
+def record_railway_act(ticket_id):
+    """
+    Record the Temiryo'l Express act (monthly invoice from UzRailways)
+    and mark the ticket as reconciled.
+    """
+    ticket = RailwayTicket.query.get_or_404(ticket_id)
+    data   = request.get_json(silent=True) or {}
+
+    ticket.act_temiryol   = True
+    ticket.act_reconciled = bool(data.get("reconciled", True))
+    if data.get("price"):
+        ticket.price = data["price"]
+
+    # Create invoice record
+    accounting = ticket.booking.accounting
+    if accounting:
+        inv = Invoice(
+            accounting_id = accounting.id,
+            supplier_type = "railway",
+            supplier_name = "Temiryo'l Express / UzRailways",
+            amount        = ticket.price,
+            status        = InvoiceStatus.PRICE_OK if ticket.act_reconciled else InvoiceStatus.PENDING,
+            invoice_number= data.get("invoice_number"),
+        )
+        db.session.add(inv)
+
+    AuditLog.log("railway_ticket", ticket.id, "act_recorded",
+                 new_value=f"reconciled={ticket.act_reconciled}",
+                 performed_by=data.get("performed_by", "staff"))
+    db.session.commit()
+    return success_response(data=ticket.to_dict(), message="Railway act recorded. ✅")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# B) AVIATION TICKETS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bp.route("/bookings/<int:booking_id>/aviation-tickets", methods=["GET"])
+def list_aviation_tickets(booking_id):
+    TourBooking.query.get_or_404(booking_id)
+    tickets = AviationTicket.query.filter_by(booking_id=booking_id).all()
+    return success_response(data=[t.to_dict() for t in tickets])
+
+
+@bp.route("/bookings/<int:booking_id>/aviation-tickets", methods=["POST"])
+@require_json("passenger_name", "airline", "route_from", "route_to", "departure_datetime")
+def create_aviation_ticket(booking_id):
+    """Register a flight ticket requirement."""
+    booking = TourBooking.query.get_or_404(booking_id)
+    data    = request.get_json()
+
+    try:
+        dep_dt = datetime.fromisoformat(data["departure_datetime"])
+    except ValueError:
+        return error_response("departure_datetime must be ISO format: YYYY-MM-DDTHH:MM", 422)
+
+    arr_dt = None
+    if data.get("arrival_datetime"):
+        try:
+            arr_dt = datetime.fromisoformat(data["arrival_datetime"])
+        except ValueError:
+            pass
+
+    ticket = AviationTicket(
+        booking_id          = booking.id,
+        passenger_name      = data["passenger_name"].strip(),
+        passport_number     = data.get("passport_number", "").strip() or None,
+        airline             = data["airline"].strip(),
+        flight_number       = data.get("flight_number", "").strip() or None,
+        route_from          = data["route_from"].strip(),
+        route_to            = data["route_to"].strip(),
+        departure_datetime  = dep_dt,
+        arrival_datetime    = arr_dt,
+        seat_class          = data.get("seat_class", "economy"),
+        price               = data.get("price"),
+        tax                 = data.get("tax"),
+        status              = TicketStatus.NOT_PURCHASED,
+        notes               = data.get("notes"),
+    )
+    db.session.add(ticket)
+    db.session.flush()
+    AuditLog.log("aviation_ticket", ticket.id, "created",
+                 performed_by=data.get("created_by", "staff"))
+    db.session.commit()
+    return success_response(data=ticket.to_dict(), status_code=201,
+                            message="Aviation ticket requirement created.")
+
+
+@bp.route("/aviation-tickets/<int:ticket_id>/purchase", methods=["PATCH"])
+@require_json("action")
+def purchase_aviation_ticket(ticket_id):
+    """
+    action: 'book'      → seats available, book them (PNR received).
+            'waitlist'  → no seats, place on waitlist.
+    """
+    ticket = AviationTicket.query.get_or_404(ticket_id)
+    data   = request.get_json()
+    action = data.get("action", "").lower()
+
+    if action not in ("book", "waitlist"):
+        return error_response("action must be 'book' or 'waitlist'.", 422)
+
+    if action == "book":
+        ticket.pnr        = data.get("pnr", "").strip() or None
+        ticket.price      = data.get("price", ticket.price)
+        ticket.tax        = data.get("tax",   ticket.tax)
+        ticket.status     = TicketStatus.PURCHASED
+        ticket.on_waitlist= False
+        AuditLog.log("aviation_ticket", ticket.id, "booked", new_value=ticket.pnr)
+        db.session.commit()
+        return success_response(data=ticket.to_dict(), message="Flight booked. PNR recorded. ✅")
+    else:
+        ticket.on_waitlist        = True
+        ticket.waitlist_position  = data.get("waitlist_position", 1)
+        ticket.status             = TicketStatus.WAITLISTED
+        AuditLog.log("aviation_ticket", ticket.id, "waitlisted",
+                     new_value=f"position={ticket.waitlist_position}")
+        db.session.commit()
+        return success_response(data=ticket.to_dict(),
+                                message="Ticket placed on waitlist. 45-day check will run automatically.")
+
+
+@bp.route("/aviation-tickets/<int:ticket_id>/45day-check", methods=["POST"])
+def aviation_45day_check(ticket_id):
+    """
+    Manually trigger the 45-day check for a waitlisted aviation ticket.
+    If seats have become available, update status to PURCHASED.
+    """
+    ticket = AviationTicket.query.get_or_404(ticket_id)
+    data   = request.get_json(silent=True) or {}
+
+    ticket.checked_at_45_days = True
+    ticket.check_45_days_at   = datetime.utcnow()
+
+    seats_available = bool(data.get("seats_available", False))
+    if seats_available:
+        ticket.pnr    = data.get("pnr", "").strip() or ticket.pnr
+        ticket.price  = data.get("price", ticket.price)
+        ticket.status = TicketStatus.PURCHASED
+        ticket.on_waitlist = False
+        AuditLog.log("aviation_ticket", ticket.id, "45day_seats_found",
+                     new_value=ticket.pnr)
+        db.session.commit()
+        return success_response(data=ticket.to_dict(),
+                                message="45-day check: seats found and booked. ✅")
+    else:
+        AuditLog.log("aviation_ticket", ticket.id, "45day_still_waitlisted")
+        db.session.commit()
+        return success_response(data=ticket.to_dict(),
+                                message="45-day check complete — still on waitlist.")
+
+
+@bp.route("/aviation-tickets/<int:ticket_id>/issue", methods=["POST"])
+@require_json("ticket_number")
+def issue_aviation_ticket(ticket_id):
+    """Issue the ticket and send to the tour operator / client."""
+    ticket = AviationTicket.query.get_or_404(ticket_id)
+    data   = request.get_json()
+
+    if ticket.status not in (TicketStatus.PURCHASED,):
+        return error_response("Ticket must be in PURCHASED status to issue.", 409)
+
+    ticket.ticket_number     = data["ticket_number"].strip()
+    ticket.ticket_file       = data.get("ticket_file")
+    ticket.sent_to_client    = True
+    ticket.sent_to_client_at = datetime.utcnow()
+    ticket.status            = TicketStatus.SENT_TO_CLIENT
+
+    # Update accounting
+    accounting = ticket.booking.accounting
+    if accounting:
+        total = float(ticket.price or 0) + float(ticket.tax or 0)
+        accounting.aviation_cost = float(accounting.aviation_cost or 0) + total
+        accounting.recalculate()
+
+    AuditLog.log("aviation_ticket", ticket.id, "issued_and_sent",
+                 new_value=ticket.ticket_number,
+                 performed_by=data.get("performed_by", "staff"))
+    db.session.commit()
+    return success_response(data=ticket.to_dict(),
+                            message="Aviation ticket issued and sent to client. ✅")
+
+
+@bp.route("/aviation-tickets/<int:ticket_id>/act", methods=["PATCH"])
+def record_aviation_act(ticket_id):
+    """Record the aviation kassa act and reconcile."""
+    ticket = AviationTicket.query.get_or_404(ticket_id)
+    data   = request.get_json(silent=True) or {}
+
+    ticket.act_aviation_kassа = True
+    ticket.act_reconciled     = bool(data.get("reconciled", True))
+
+    accounting = ticket.booking.accounting
+    if accounting:
+        total = float(ticket.price or 0) + float(ticket.tax or 0)
+        inv   = Invoice(
+            accounting_id  = accounting.id,
+            supplier_type  = "aviation",
+            supplier_name  = ticket.airline,
+            invoice_number = data.get("invoice_number"),
+            amount         = total,
+            status         = InvoiceStatus.PRICE_OK if ticket.act_reconciled else InvoiceStatus.PENDING,
+        )
+        db.session.add(inv)
+
+    AuditLog.log("aviation_ticket", ticket.id, "act_recorded",
+                 new_value=f"reconciled={ticket.act_reconciled}",
+                 performed_by=data.get("performed_by", "staff"))
+    db.session.commit()
+    return success_response(data=ticket.to_dict(), message="Aviation act recorded. ✅")

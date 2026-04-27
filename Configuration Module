@@ -1,0 +1,65 @@
+"""
+config.py — Centralised application configuration.
+All sensitive values are read from environment variables (12-factor app style).
+Copy .env.example → .env and fill in your credentials before running.
+"""
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Config:
+    # ── Flask ────────────────────────────────────────────────────────────────
+    SECRET_KEY        = os.getenv("SECRET_KEY", "change-me-in-production")
+    DEBUG             = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+
+    # ── Database ─────────────────────────────────────────────────────────────
+    SQLALCHEMY_DATABASE_URI          = os.getenv("DATABASE_URL", "sqlite:///tour_crm.db")
+    SQLALCHEMY_TRACK_MODIFICATIONS   = False
+    SQLALCHEMY_ENGINE_OPTIONS        = {"pool_pre_ping": True}
+
+    # ── SMTP (Microsoft Office 365) ───────────────────────────────────────────
+    SMTP_HOST     = os.getenv("SMTP_HOST",     "smtp.office365.com")
+    SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+    SMTP_USER     = os.getenv("SMTP_USER",     "sales@yourcompany.com")
+    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+    SMTP_FROM     = os.getenv("SMTP_FROM",     "sales@yourcompany.com")
+
+    # ── Telegram ─────────────────────────────────────────────────────────────
+    TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_SALES_CHAT  = os.getenv("TELEGRAM_SALES_CHAT",  "")   # sales group
+    TELEGRAM_HOTEL_CHAT  = os.getenv("TELEGRAM_HOTEL_CHAT",  "")
+    TELEGRAM_GUIDE_CHAT  = os.getenv("TELEGRAM_GUIDE_CHAT",  "")
+    TELEGRAM_DRIVER_CHAT = os.getenv("TELEGRAM_DRIVER_CHAT", "")
+    TELEGRAM_ACCOUNT_CHAT= os.getenv("TELEGRAM_ACCOUNT_CHAT","")
+
+    # ── Business Rules ────────────────────────────────────────────────────────
+    CONFIRMATION_DAYS_BEFORE = 45   # Days before tour to send TO confirmation
+    DRIVER_ASSIGN_DAYS       = 14   # Days before tour to assign drivers
+    DRIVER_REMIND_DAYS       = 1    # Days before tour to remind driver
+    GUIDE_CANCEL_COLOR       = "blue"
+    GUIDE_PENDING_COLOR      = "orange"
+    GUIDE_CONFIRMED_COLOR    = "green"
+    GUIDE_UNASSIGNED_COLOR   = "red"
+
+    # ── Company ───────────────────────────────────────────────────────────────
+    COMPANY_NAME = os.getenv("COMPANY_NAME", "YourTourCompany")
+    COMPANY_EMAIL= os.getenv("COMPANY_EMAIL","info@yourcompany.com")
+
+
+class DevelopmentConfig(Config):
+    DEBUG = True
+    SQLALCHEMY_DATABASE_URI = "sqlite:///tour_crm_dev.db"
+
+
+class ProductionConfig(Config):
+    DEBUG = False
+
+
+config_by_name = {
+    "development": DevelopmentConfig,
+    "production":  ProductionConfig,
+    "default":     DevelopmentConfig,
+}

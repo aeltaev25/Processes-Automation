@@ -1,0 +1,293 @@
+"""
+services/scheduler.py
+──────────────────────
+Background scheduler (APScheduler) that runs automated tasks:
+
+  1. Every morning — check which bookings need a 45-day TO confirmation.
+  2. Every morning — assign drivers for tours in 14 days.
+  3. Every morning — send 1-day-before reminders to drivers.
+  4. Every morning — send 1-day-before guide info via Telegram.
+  5. End-of-day    — flag bookings where tour has ended but services not marked rendered.
+  6. Monthly (1st) — flag open driver/guide invoices for month-end reconciliation.
+  7. Daily         — check aviation tickets at 45-day mark.
+"""
+
+import logging
+from datetime import date, timedelta
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron         import CronTrigger
+
+logger = logging.getLogger(__name__)
+_scheduler = BackgroundScheduler(timezone="Asia/Tashkent")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _with_app(app, fn):
+    """Wrap a job so it runs inside the Flask application context."""
+    def wrapper(*args, **kwargs):
+        with app.app_context():
+            fn(*args, **kwargs)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB IMPLEMENTATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def job_45day_hotel_confirmation():
+    """
+    For every active hotel request whose check-in is exactly 45 days away
+    and whose 45-day confirmation has not yet been sent, send it now.
+    """
+    from models import db, HotelRequest, TourBooking, HotelRequestStatus
+    from services.notifications import NotificationService
+
+    target_date = date.today() + timedelta(days=45)
+    requests = (
+        HotelRequest.query
+        .join(TourBooking)
+        .filter(
+            HotelRequest.check_in == target_date,
+            HotelRequest.status   == HotelRequestStatus.BOOKED,
+            HotelRequest.confirm_sent_at.is_(None),
+        )
+        .all()
+    )
+    logger.info(f"[Scheduler] 45-day check: {len(requests)} hotel confirmation(s) to send.")
+    for hr in requests:
+        try:
+            NotificationService.hotel_45day_confirmation(hr.booking, hr)
+            from datetime import datetime
+            hr.confirm_sent_at = datetime.utcnow()
+            from models import AuditLog
+            AuditLog.log("hotel_request", hr.id, "45day_confirmation_sent")
+            db.session.commit()
+        except Exception as exc:
+            logger.error(f"[Scheduler] 45-day confirm failed for HotelRequest #{hr.id}: {exc}")
+            db.session.rollback()
+
+
+def job_45day_aviation_check():
+    """
+    For aviation tickets on waitlist, check if seats have freed up 45 days before departure.
+    """
+    from models import db, AviationTicket, TicketStatus
+    from datetime import datetime
+
+    target_date = date.today() + timedelta(days=45)
+    tickets = (
+        AviationTicket.query
+        .filter(
+            AviationTicket.on_waitlist == True,
+            AviationTicket.checked_at_45_days == False,
+        )
+        .all()
+    )
+    for ticket in tickets:
+        dep = ticket.departure_datetime
+        if dep and dep.date() == target_date:
+            ticket.checked_at_45_days = True
+            ticket.check_45_days_at   = datetime.utcnow()
+            logger.info(
+                f"[Scheduler] Aviation ticket #{ticket.id} — 45-day waitlist check flagged."
+            )
+    db.session.commit()
+
+
+def job_assign_drivers():
+    """
+    Flag transport assignments that are 14 days away but still PLANNED
+    (no driver assigned). Log a warning so ops staff can act.
+    """
+    from models import TransportAssignment, TransportStatus
+
+    target_date = date.today() + timedelta(days=14)
+    unassigned = (
+        TransportAssignment.query
+        .filter(
+            TransportAssignment.service_date == target_date,
+            TransportAssignment.status       == TransportStatus.PLANNED,
+            TransportAssignment.driver_id.is_(None),
+        )
+        .all()
+    )
+    if unassigned:
+        logger.warning(
+            f"[Scheduler] ⚠️  {len(unassigned)} transport(s) in 14 days have NO driver assigned!"
+        )
+        # In production: send a Telegram alert to the operations manager
+        for ta in unassigned:
+            logger.warning(
+                f"  → TransportAssignment #{ta.id} | Booking #{ta.booking_id} | "
+                f"{ta.service_date} {ta.service_time} | {ta.pickup_location}"
+            )
+
+
+def job_driver_day_before_reminder():
+    """
+    Send 1-day-before Telegram reminder to every assigned driver.
+    """
+    from models import db, TransportAssignment, TransportStatus
+    from services.notifications import NotificationService
+    from datetime import datetime
+
+    tomorrow = date.today() + timedelta(days=1)
+    assignments = (
+        TransportAssignment.query
+        .filter(
+            TransportAssignment.service_date    == tomorrow,
+            TransportAssignment.status          == TransportStatus.ASSIGNED,
+            TransportAssignment.reminder_sent_at.is_(None),
+            TransportAssignment.driver_id.isnot(None),
+        )
+        .all()
+    )
+    logger.info(f"[Scheduler] Driver reminders: {len(assignments)} to send.")
+    for ta in assignments:
+        try:
+            sent = NotificationService.driver_reminder(ta.booking, ta)
+            if sent:
+                ta.reminder_sent_at = datetime.utcnow()
+                ta.status           = TransportStatus.REMINDED
+                from models import AuditLog
+                AuditLog.log("transport_assignment", ta.id, "reminder_sent")
+        except Exception as exc:
+            logger.error(f"[Scheduler] Driver reminder failed for TA #{ta.id}: {exc}")
+    db.session.commit()
+
+
+def job_guide_day_before_info():
+    """
+    Send day-before tour info to each confirmed guide.
+    Also runs on Fridays for weekend tours.
+    """
+    from models import db, GuideAssignment, GuideStatus
+    from services.notifications import NotificationService
+    from datetime import datetime
+
+    tomorrow = date.today() + timedelta(days=1)
+    is_friday = date.today().weekday() == 4  # Monday=0, Friday=4
+
+    query = GuideAssignment.query.filter(
+        GuideAssignment.status       == GuideStatus.CONFIRMED,
+        GuideAssignment.info_sent_via_tg == False,
+        GuideAssignment.guide_id.isnot(None),
+    )
+    if is_friday:
+        # On Fridays also cover Saturday and Sunday
+        weekend = [tomorrow, tomorrow + timedelta(days=1)]
+        query = query.filter(GuideAssignment.service_date.in_(weekend))
+    else:
+        query = query.filter(GuideAssignment.service_date == tomorrow)
+
+    assignments = query.all()
+    logger.info(f"[Scheduler] Guide day-before info: {len(assignments)} to send.")
+    for ga in assignments:
+        try:
+            sent = NotificationService.guide_day_before_info(ga.booking, ga)
+            if sent:
+                ga.info_sent_via_tg = True
+                ga.info_sent_at     = datetime.utcnow()
+                from models import AuditLog
+                AuditLog.log("guide_assignment", ga.id, "day_before_info_sent")
+        except Exception as exc:
+            logger.error(f"[Scheduler] Guide info failed for GA #{ga.id}: {exc}")
+    db.session.commit()
+
+
+def job_mark_completed_tours():
+    """
+    Every evening: find bookings whose departure_date has passed but
+    status is still IN_PROGRESS — mark them as needing services-rendered confirmation.
+    """
+    from models import db, TourBooking, BookingStatus
+
+    yesterday = date.today() - timedelta(days=1)
+    bookings = (
+        TourBooking.query
+        .filter(
+            TourBooking.departure_date <= yesterday,
+            TourBooking.status         == BookingStatus.IN_PROGRESS,
+            TourBooking.services_rendered == False,
+        )
+        .all()
+    )
+    logger.info(f"[Scheduler] Tours to mark completed: {len(bookings)}")
+    for b in bookings:
+        b.services_rendered = True
+        logger.info(f"  → Booking {b.booking_ref} — services_rendered = True")
+    if bookings:
+        db.session.commit()
+
+
+def job_monthly_reconciliation_flag():
+    """
+    On the 1st of each month: flag all open transport/guide assignments
+    for month-end reconciliation.
+    """
+    from models import db, TransportAssignment, GuideAssignment, TransportStatus, GuideStatus
+
+    unreconciled_drivers = (
+        TransportAssignment.query
+        .filter(
+            TransportAssignment.status == TransportStatus.COMPLETED,
+            TransportAssignment.monthly_reconciled == False,
+        )
+        .count()
+    )
+    unreconciled_guides = (
+        GuideAssignment.query
+        .filter(
+            GuideAssignment.status == GuideStatus.CONFIRMED,
+            GuideAssignment.monthly_collected == False,
+        )
+        .count()
+    )
+    logger.warning(
+        f"[Scheduler] Month-end: {unreconciled_drivers} driver payments + "
+        f"{unreconciled_guides} guide payments pending reconciliation."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEDULER BOOTSTRAP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def init_scheduler(app):
+    """
+    Register all jobs and start the scheduler.
+    Call this once from the Flask app factory.
+    """
+    jobs = [
+        # Daily at 07:00 — 45-day hotel confirmations
+        (_with_app(app, job_45day_hotel_confirmation),
+         CronTrigger(hour=7, minute=0)),
+        # Daily at 07:05 — 45-day aviation checks
+        (_with_app(app, job_45day_aviation_check),
+         CronTrigger(hour=7, minute=5)),
+        # Daily at 07:10 — flag transports with no driver in 14 days
+        (_with_app(app, job_assign_drivers),
+         CronTrigger(hour=7, minute=10)),
+        # Daily at 08:00 — 1-day-before driver reminders
+        (_with_app(app, job_driver_day_before_reminder),
+         CronTrigger(hour=8, minute=0)),
+        # Daily at 08:15 — 1-day-before guide info (+ Friday weekend coverage)
+        (_with_app(app, job_guide_day_before_info),
+         CronTrigger(hour=8, minute=15)),
+        # Daily at 22:00 — mark completed tours
+        (_with_app(app, job_mark_completed_tours),
+         CronTrigger(hour=22, minute=0)),
+        # Monthly 1st at 09:00 — month-end reconciliation flag
+        (_with_app(app, job_monthly_reconciliation_flag),
+         CronTrigger(day=1, hour=9, minute=0)),
+    ]
+
+    for fn, trigger in jobs:
+        _scheduler.add_job(fn, trigger, id=fn.__name__, replace_existing=True)
+
+    _scheduler.start()
+    logger.info("[Scheduler] ✅ All background jobs registered and running.")
+    return _scheduler
