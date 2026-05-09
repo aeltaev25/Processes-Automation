@@ -1,0 +1,68 @@
+/**
+ * ADVANTOUR — Prometheus Metrics Middleware
+ *
+ * Collects HTTP request metrics automatically for every route.
+ * Grafana then visualizes these on the operations dashboard.
+ *
+ * METRICS EXPOSED:
+ *   http_requests_total         — counter by method, route, status
+ *   http_request_duration_ms    — histogram of response times
+ *   process_memory_bytes        — Node.js heap usage
+ */
+
+'use strict';
+
+const client = require('prom-client');
+
+// Enable default metrics: CPU, memory, event loop lag, GC
+const register = new client.Registry();
+client.collectDefaultMetrics({ register });
+
+// HTTP request counter
+const httpRequestsTotal = new client.Counter({
+  name:       'http_requests_total',
+  help:       'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status_code'],
+  registers:  [register],
+});
+
+// HTTP response time histogram (buckets in milliseconds)
+const httpRequestDurationMs = new client.Histogram({
+  name:       'http_request_duration_ms',
+  help:       'Duration of HTTP requests in milliseconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets:    [10, 50, 100, 200, 500, 1000, 2000, 5000],
+  registers:  [register],
+});
+
+// Database query duration
+const dbQueryDurationMs = new client.Histogram({
+  name:      'db_query_duration_ms',
+  help:      'Duration of database queries in milliseconds',
+  labelNames: ['operation'],
+  buckets:   [5, 10, 25, 50, 100, 250, 500, 1000],
+  registers: [register],
+});
+
+/**
+ * metricsMiddleware
+ * Records timing and labels for every HTTP request.
+ */
+const metricsMiddleware = (req, res, next) => {
+  const start = Date.now();
+  const route = req.route?.path || req.path || 'unknown';
+
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const labels   = { method: req.method, route, status_code: res.statusCode };
+
+    httpRequestsTotal.inc(labels);
+    httpRequestDurationMs.observe(labels, duration);
+  });
+
+  next();
+};
+
+module.exports = metricsMiddleware;
+module.exports.register        = register;
+module.exports.dbQueryDurationMs = dbQueryDurationMs;

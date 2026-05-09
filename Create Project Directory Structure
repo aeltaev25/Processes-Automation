@@ -1,0 +1,6 @@
+bash
+
+mkdir -p /home/claude/advantour/{backend/{src/{routes,controllers,services,middleware,models,config},tests},frontend/src/{components,pages,hooks,services,utils},k8s/{namespaces,deployments,services,configmaps,hpa,ingress},monitoring/{prometheus,grafana,alerts},cicd,db/migrations,scripts}
+Output
+
+exit code 0

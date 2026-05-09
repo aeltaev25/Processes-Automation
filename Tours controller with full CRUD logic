@@ -1,0 +1,280 @@
+/**
+ * ADVANTOUR — Tours Controller
+ *
+ * Business logic for tour CRUD operations.
+ * Calls the database directly for simple queries,
+ * or calls the TourSaga service for complex multi-step operations.
+ *
+ * CONVENTIONS:
+ *   - All IDs are UUIDs (PostgreSQL gen_random_uuid())
+ *   - Dates are ISO 8601 strings in UTC
+ *   - Pagination: ?page=1&limit=20 (default limit 20, max 100)
+ *   - Soft deletes: status = 'deleted', never hard DELETE
+ */
+
+'use strict';
+
+const { query, withTransaction } = require('../config/database');
+const { cachedQuery, invalidateCache } = require('../config/redis');
+const { publishEvent } = require('../config/rabbitmq');
+const logger = require('../config/logger');
+const { AppError } = require('../middleware/errorHandler');
+
+/**
+ * GET /api/v1/tours
+ * Lists active tours with pagination and optional filters.
+ * Response is cached in Redis for 5 minutes.
+ */
+const listTours = async (req, res, next) => {
+  try {
+    const page   = Math.max(1, parseInt(req.query.page  || '1'));
+    const limit  = Math.min(100, parseInt(req.query.limit || '20'));
+    const offset = (page - 1) * limit;
+    const status = req.query.status || 'active';
+
+    const cacheKey = `tours:list:${status}:${page}:${limit}`;
+
+    const result = await cachedQuery(cacheKey, 300, async () => {
+      // Count query for pagination metadata
+      const countResult = await query(
+        `SELECT COUNT(*) FROM tours WHERE status = $1`,
+        [status]
+      );
+      const total = parseInt(countResult.rows[0].count);
+
+      // Data query
+      const dataResult = await query(
+        `SELECT
+           t.tour_id,
+           t.deal_id,
+           t.title,
+           t.start_date,
+           t.end_date,
+           t.status,
+           t.destination,
+           t.pax_count,
+           t.created_at,
+           u.email AS created_by_email
+         FROM tours t
+         LEFT JOIN app_users u ON t.created_by = u.user_id
+         WHERE t.status = $1
+         ORDER BY t.start_date ASC
+         LIMIT $2 OFFSET $3`,
+        [status, limit, offset]
+      );
+
+      return {
+        data:       dataResult.rows,
+        pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+      };
+    });
+
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/v1/tours/:id
+ * Returns a single tour by UUID.
+ */
+const getTour = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const result = await query(
+      `SELECT t.*, u.email AS created_by_email
+       FROM tours t
+       LEFT JOIN app_users u ON t.created_by = u.user_id
+       WHERE t.tour_id = $1 AND t.status != 'deleted'`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      throw new AppError('Tour not found', 404);
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/v1/tours
+ * Creates a new tour and triggers the TourSaga (guide + transport reservation).
+ * Uses a database transaction to ensure atomicity.
+ */
+const createTour = async (req, res, next) => {
+  try {
+    const {
+      deal_id,
+      title,
+      start_date,
+      end_date,
+      destination,
+      pax_count,
+      guide_requirements,
+      transport_type,
+      notes,
+    } = req.body;
+
+    const tourData = await withTransaction(async (client) => {
+      // 1. Insert the tour record
+      const insertResult = await client.query(
+        `INSERT INTO tours (
+           deal_id, title, start_date, end_date,
+           destination, pax_count, guide_requirements,
+           transport_type, notes, status, created_by
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10)
+         RETURNING *`,
+        [
+          deal_id, title, start_date, end_date,
+          destination, pax_count,
+          JSON.stringify(guide_requirements || {}),
+          transport_type, notes,
+          req.user.userId,
+        ]
+      );
+
+      const tour = insertResult.rows[0];
+
+      // 2. Create audit record inside the same transaction
+      await client.query(
+        `INSERT INTO audit_trail (table_name, operation, changed_by, new_state)
+         VALUES ('tours', 'INSERT', $1, $2)`,
+        [req.user.userId, JSON.stringify(tour)]
+      );
+
+      return tour;
+    });
+
+    // 3. Invalidate cached tour lists so next list request reflects the new tour
+    await invalidateCache('tours:list:*');
+
+    // 4. Publish event to trigger async saga (guide assignment, finance posting)
+    await publishEvent('tour.created', {
+      tour_id:    tourData.tour_id,
+      deal_id:    tourData.deal_id,
+      start_date: tourData.start_date,
+    });
+
+    logger.info(`Tour created: ${tourData.tour_id} by user ${req.user.userId}`);
+
+    res.status(201).json(tourData);
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * PUT /api/v1/tours/:id
+ * Updates an existing tour. Only updatable fields are accepted (whitelist approach).
+ */
+const updateTour = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const allowedFields = ['title', 'start_date', 'end_date', 'destination', 'pax_count', 'notes', 'status'];
+    const updates = {};
+
+    for (const field of allowedFields) {
+      if (req.body[field] !== undefined) {
+        updates[field] = req.body[field];
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      throw new AppError('No updatable fields provided', 400);
+    }
+
+    // Build dynamic SET clause: "title = $2, status = $3"
+    const setClause = Object.keys(updates)
+      .map((key, i) => `${key} = $${i + 2}`)
+      .join(', ');
+    const values = [id, ...Object.values(updates)];
+
+    const result = await withTransaction(async (client) => {
+      // Get OLD state for audit trail
+      const oldResult = await client.query('SELECT * FROM tours WHERE tour_id = $1', [id]);
+      if (oldResult.rows.length === 0) throw new AppError('Tour not found', 404);
+      const oldState = oldResult.rows[0];
+
+      const updateResult = await client.query(
+        `UPDATE tours SET ${setClause}, updated_at = NOW()
+         WHERE tour_id = $1 AND status != 'deleted'
+         RETURNING *`,
+        values
+      );
+
+      // Write audit record: stores BEFORE and AFTER state
+      await client.query(
+        `INSERT INTO audit_trail (table_name, operation, changed_by, old_state, new_state)
+         VALUES ('tours', 'UPDATE', $1, $2, $3)`,
+        [req.user.userId, JSON.stringify(oldState), JSON.stringify(updateResult.rows[0])]
+      );
+
+      return updateResult.rows[0];
+    });
+
+    await invalidateCache('tours:list:*');
+    await invalidateCache(`tours:detail:${id}`);
+
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * DELETE /api/v1/tours/:id
+ * Soft delete — sets status to 'deleted'. Never removes the row.
+ * Hard deletes violate the audit trail requirement.
+ */
+const deleteTour = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const result = await query(
+      `UPDATE tours SET status = 'deleted', updated_at = NOW()
+       WHERE tour_id = $1 AND status != 'deleted'
+       RETURNING tour_id`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      throw new AppError('Tour not found or already deleted', 404);
+    }
+
+    await invalidateCache('tours:list:*');
+
+    logger.info(`Tour soft-deleted: ${id} by user ${req.user.userId}`);
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/v1/tours/:id/timeline
+ * Returns the saga state machine steps for a tour.
+ * Used by the dashboard to show: INIT → GUIDE_RESERVED → TRANSPORT_RESERVED → COMPLETED
+ */
+const getTourTimeline = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const result = await query(
+      `SELECT step, status, completed_at, error_message
+       FROM tour_saga_steps
+       WHERE tour_id = $1
+       ORDER BY step_order ASC`,
+      [id]
+    );
+
+    res.json({ tour_id: id, steps: result.rows });
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { listTours, getTour, createTour, updateTour, deleteTour, getTourTimeline };

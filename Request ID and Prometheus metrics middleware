@@ -1,0 +1,18 @@
+/**
+ * ADVANTOUR — Request ID Middleware
+ * Attaches a unique trace ID to every request.
+ * Forwarded to downstream services via X-Request-ID header.
+ */
+
+'use strict';
+
+const { v4: uuidv4 } = require('uuid');
+
+const requestId = (req, res, next) => {
+  // Honor upstream trace ID (from nginx / other service) or generate a new one
+  req.id = req.headers['x-request-id'] || uuidv4();
+  res.setHeader('X-Request-ID', req.id);
+  next();
+};
+
+module.exports = requestId;

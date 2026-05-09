@@ -1,7 +1,0 @@
-bash
-
-mkdir -p /home/claude/tour_crm/{routes,services,templates}
-echo "Structure created"
-Output
-
-Structure created

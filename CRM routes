@@ -1,0 +1,173 @@
+/**
+ * ADVANTOUR — CRM Routes
+ * Customer Relationship Management for tour clients.
+ *
+ * Endpoints:
+ *   GET    /api/v1/crm/contacts          — list all contacts
+ *   GET    /api/v1/crm/contacts/:id      — get contact detail
+ *   POST   /api/v1/crm/contacts          — create contact
+ *   PUT    /api/v1/crm/contacts/:id      — update contact
+ *   GET    /api/v1/crm/contacts/:id/tours — tours linked to this contact
+ *   GET    /api/v1/crm/pipeline          — sales pipeline (deals by stage)
+ *   POST   /api/v1/crm/deals             — create deal
+ *   PATCH  /api/v1/crm/deals/:id/stage   — move deal to a new stage
+ */
+
+'use strict';
+
+const express = require('express');
+const router  = express.Router();
+const { authenticate, authorize } = require('../middleware/auth');
+const { query, withTransaction } = require('../config/database');
+const { cachedQuery, invalidateCache } = require('../config/redis');
+const { AppError } = require('../middleware/errorHandler');
+const logger = require('../config/logger');
+
+// ── GET /api/v1/crm/contacts ─────────────────────────────────────────────────
+router.get('/contacts', authenticate, async (req, res, next) => {
+  try {
+    const page   = Math.max(1, parseInt(req.query.page  || '1'));
+    const limit  = Math.min(100, parseInt(req.query.limit || '20'));
+    const offset = (page - 1) * limit;
+    const search = req.query.search || '';
+
+    let queryText = `
+      SELECT
+        c.contact_id, c.first_name, c.last_name, c.email,
+        c.phone, c.nationality, c.source, c.created_at,
+        COUNT(d.deal_id) AS deal_count,
+        SUM(d.total_value) FILTER (WHERE d.status = 'won') AS total_won
+      FROM crm_contacts c
+      LEFT JOIN crm_deals d ON d.contact_id = c.contact_id
+      WHERE c.is_active = true
+    `;
+    const params = [];
+
+    if (search) {
+      params.push(`%${search}%`);
+      queryText += ` AND (c.first_name ILIKE $${params.length} OR c.last_name ILIKE $${params.length} OR c.email ILIKE $${params.length})`;
+    }
+
+    queryText += ` GROUP BY c.contact_id ORDER BY c.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(limit, offset);
+
+    const result = await query(queryText, params);
+    res.json({ data: result.rows, pagination: { page, limit } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/v1/crm/contacts ────────────────────────────────────────────────
+router.post('/contacts', authenticate, authorize('admin', 'manager', 'sales_agent'), async (req, res, next) => {
+  try {
+    const { first_name, last_name, email, phone, nationality, source, notes } = req.body;
+
+    const result = await query(
+      `INSERT INTO crm_contacts
+         (first_name, last_name, email, phone, nationality, source, notes, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING *`,
+      [first_name, last_name, email, phone, nationality, source, notes, req.user.userId]
+    );
+
+    await invalidateCache('crm:contacts:*');
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── GET /api/v1/crm/pipeline ─────────────────────────────────────────────────
+router.get('/pipeline', authenticate, async (req, res, next) => {
+  try {
+    const result = await cachedQuery('crm:pipeline', 120, async () => {
+      const data = await query(
+        `SELECT
+           stage,
+           COUNT(*)             AS deal_count,
+           SUM(total_value)     AS stage_value,
+           AVG(total_value)     AS avg_deal_value
+         FROM crm_deals
+         WHERE status = 'active'
+         GROUP BY stage
+         ORDER BY
+           CASE stage
+             WHEN 'lead'       THEN 1
+             WHEN 'qualified'  THEN 2
+             WHEN 'proposal'   THEN 3
+             WHEN 'negotiation' THEN 4
+             WHEN 'won'        THEN 5
+             WHEN 'lost'       THEN 6
+             ELSE 99
+           END`
+      );
+      return data.rows;
+    });
+
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/v1/crm/deals ───────────────────────────────────────────────────
+router.post('/deals', authenticate, authorize('admin', 'manager', 'sales_agent'), async (req, res, next) => {
+  try {
+    const { contact_id, title, total_value, currency, stage, expected_close_date, notes } = req.body;
+
+    const result = await query(
+      `INSERT INTO crm_deals
+         (contact_id, title, total_value, currency, stage, expected_close_date, notes, assigned_to)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING *`,
+      [contact_id, title, total_value, currency || 'USD', stage || 'lead',
+       expected_close_date, notes, req.user.userId]
+    );
+
+    await invalidateCache('crm:pipeline');
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PATCH /api/v1/crm/deals/:id/stage ────────────────────────────────────────
+router.patch('/deals/:id/stage', authenticate, async (req, res, next) => {
+  try {
+    const { id }    = req.params;
+    const { stage } = req.body;
+
+    const validStages = ['lead', 'qualified', 'proposal', 'negotiation', 'won', 'lost'];
+    if (!validStages.includes(stage)) {
+      throw new AppError(`Invalid stage. Must be one of: ${validStages.join(', ')}`, 400);
+    }
+
+    const result = await withTransaction(async (client) => {
+      const old = await client.query('SELECT * FROM crm_deals WHERE deal_id = $1', [id]);
+      if (!old.rows[0]) throw new AppError('Deal not found', 404);
+
+      const updated = await client.query(
+        `UPDATE crm_deals SET stage = $1, updated_at = NOW()
+         WHERE deal_id = $2 RETURNING *`,
+        [stage, id]
+      );
+
+      // Log stage transition for funnel analytics
+      await client.query(
+        `INSERT INTO crm_deal_stage_history (deal_id, from_stage, to_stage, changed_by)
+         VALUES ($1, $2, $3, $4)`,
+        [id, old.rows[0].stage, stage, req.user.userId]
+      );
+
+      return updated.rows[0];
+    });
+
+    await invalidateCache('crm:pipeline');
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;

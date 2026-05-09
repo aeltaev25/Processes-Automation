@@ -1,0 +1,82 @@
+/**
+ * ADVANTOUR — Operations Routes
+ * Guide assignment, transport management, saga state queries.
+ */
+
+'use strict';
+
+const express = require('express');
+const router  = express.Router();
+const { authenticate, authorize } = require('../middleware/auth');
+const { query } = require('../config/database');
+const { AppError } = require('../middleware/errorHandler');
+
+// GET /api/v1/operations/guides — list available guides
+router.get('/guides', authenticate, async (req, res, next) => {
+  try {
+    const { start_date, end_date, language } = req.query;
+
+    let sql = `
+      SELECT
+        g.guide_id, g.first_name, g.last_name,
+        g.languages, g.city, g.rating, g.active_tours
+      FROM guides g
+      WHERE g.is_active = true
+    `;
+    const params = [];
+
+    if (language) {
+      params.push(language);
+      sql += ` AND $${params.length} = ANY(g.languages)`;
+    }
+
+    if (start_date && end_date) {
+      params.push(start_date, end_date);
+      sql += ` AND g.guide_id NOT IN (
+        SELECT guide_id FROM guide_assignments
+        WHERE NOT (end_date < $${params.length - 1} OR start_date > $${params.length})
+      )`;
+    }
+
+    sql += ' ORDER BY g.rating DESC';
+
+    const result = await query(sql, params);
+    res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/v1/operations/guides/:id/assign — assign guide to tour
+router.post('/guides/:guideId/assign', authenticate, authorize('admin', 'manager'), async (req, res, next) => {
+  try {
+    const { guideId } = req.params;
+    const { tour_id, start_date, end_date } = req.body;
+
+    // Check for scheduling conflicts
+    const conflict = await query(
+      `SELECT 1 FROM guide_assignments
+       WHERE guide_id = $1
+         AND NOT (end_date < $2 OR start_date > $3)
+       LIMIT 1`,
+      [guideId, start_date, end_date]
+    );
+
+    if (conflict.rows.length > 0) {
+      throw new AppError('Guide has a scheduling conflict for these dates', 409);
+    }
+
+    const result = await query(
+      `INSERT INTO guide_assignments (guide_id, tour_id, start_date, end_date, assigned_by)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [guideId, tour_id, start_date, end_date, req.user.userId]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;

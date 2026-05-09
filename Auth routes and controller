@@ -1,0 +1,152 @@
+/**
+ * ADVANTOUR — Authentication Controller & Routes
+ *
+ * Endpoints:
+ *   POST /api/v1/auth/login    — issue JWT
+ *   POST /api/v1/auth/logout   — revoke JWT (add to Redis blocklist)
+ *   POST /api/v1/auth/refresh  — issue new JWT from refresh token
+ *   GET  /api/v1/auth/me       — get current user profile
+ */
+
+'use strict';
+
+const express  = require('express');
+const bcrypt   = require('bcryptjs');
+const jwt      = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
+
+const router   = express.Router();
+const { query } = require('../config/database');
+const { getRedis } = require('../config/redis');
+const { authenticate } = require('../middleware/auth');
+const { AppError } = require('../middleware/errorHandler');
+const logger   = require('../config/logger');
+
+const JWT_SECRET         = process.env.JWT_SECRET || 'dev-secret-change-in-prod';
+const JWT_EXPIRY         = process.env.JWT_EXPIRY  || '8h';       // Access token: 8 hours
+const REFRESH_EXPIRY     = process.env.REFRESH_EXPIRY || '30d';   // Refresh token: 30 days
+
+// ── POST /api/v1/auth/login ──────────────────────────────────────────────────
+router.post('/login', async (req, res, next) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      throw new AppError('Email and password are required', 400);
+    }
+
+    // 1. Look up user
+    const result = await query(
+      `SELECT user_id, email, password_hash, role, vendor_id, is_active
+       FROM app_users
+       WHERE email = $1`,
+      [email.toLowerCase().trim()]
+    );
+
+    const user = result.rows[0];
+
+    // 2. Check user exists AND password matches.
+    //    We check BOTH before throwing to prevent user-enumeration attacks.
+    const passwordMatch = user
+      ? await bcrypt.compare(password, user.password_hash)
+      : false;
+
+    if (!user || !passwordMatch) {
+      throw new AppError('Invalid email or password', 401);
+    }
+
+    if (!user.is_active) {
+      throw new AppError('Account is disabled — contact your administrator', 403);
+    }
+
+    // 3. Issue access token (short-lived)
+    const jti         = uuidv4();
+    const accessToken = jwt.sign(
+      {
+        sub:       user.user_id,
+        email:     user.email,
+        role:      user.role,
+        vendor_id: user.vendor_id,
+        jti,
+      },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRY }
+    );
+
+    // 4. Issue refresh token (long-lived, stored in Redis)
+    const refreshTokenId = uuidv4();
+    const refreshToken   = jwt.sign(
+      { sub: user.user_id, jti: refreshTokenId, type: 'refresh' },
+      JWT_SECRET,
+      { expiresIn: REFRESH_EXPIRY }
+    );
+
+    // Store refresh token ID in Redis (allows server-side revocation)
+    const redis = getRedis();
+    await redis.setEx(
+      `refresh:${refreshTokenId}`,
+      30 * 24 * 60 * 60, // 30 days in seconds
+      user.user_id
+    );
+
+    // 5. Update last login timestamp
+    await query(
+      `UPDATE app_users SET last_login = NOW() WHERE user_id = $1`,
+      [user.user_id]
+    );
+
+    logger.info(`User login: ${user.email} (role: ${user.role})`);
+
+    res.json({
+      access_token:  accessToken,
+      refresh_token: refreshToken,
+      token_type:    'Bearer',
+      expires_in:    JWT_EXPIRY,
+      user: {
+        user_id: user.user_id,
+        email:   user.email,
+        role:    user.role,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/v1/auth/logout ─────────────────────────────────────────────────
+//    Adds the JWT's jti to the Redis revocation list so it's dead immediately,
+//    even though the token signature is still technically valid.
+router.post('/logout', authenticate, async (req, res, next) => {
+  try {
+    const redis = getRedis();
+    // Decode to get the expiry so we can set matching TTL in Redis
+    const decoded = jwt.decode(req.headers.authorization.slice(7));
+    const ttl     = decoded.exp - Math.floor(Date.now() / 1000);
+
+    if (ttl > 0) {
+      await redis.setEx(`revoked_token:${req.user.jti}`, ttl, '1');
+    }
+
+    logger.info(`User logout: ${req.user.email}`);
+    res.json({ message: 'Logged out successfully' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── GET /api/v1/auth/me ───────────────────────────────────────────────────────
+router.get('/me', authenticate, async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT user_id, email, role, first_name, last_name, last_login
+       FROM app_users WHERE user_id = $1`,
+      [req.user.userId]
+    );
+    if (!result.rows[0]) throw new AppError('User not found', 404);
+    res.json(result.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;

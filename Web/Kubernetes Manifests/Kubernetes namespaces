@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ADVANTOUR — Kubernetes Namespaces
+#
+# We separate workloads into 4 namespaces:
+#
+#   advantour-dev        — Developer sandbox (broken = fine, no one cares)
+#   advantour-staging    — Mirror of production for final QA before release
+#   advantour-prod       — Live production (all customer traffic goes here)
+#   monitoring           — Prometheus, Grafana, Loki (shared across all envs)
+#
+# HOW TO APPLY:
+#   kubectl apply -f k8s/namespaces/namespaces.yaml
+#
+# HOW TO VERIFY:
+#   kubectl get namespaces | grep advantour
+# ─────────────────────────────────────────────────────────────────────────────
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: advantour-dev
+  labels:
+    environment: development
+    team: advantour-engineering
+    managed-by: kubectl
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: advantour-staging
+  labels:
+    environment: staging
+    team: advantour-engineering
+    managed-by: kubectl
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: advantour-prod
+  labels:
+    environment: production
+    team: advantour-engineering
+    managed-by: kubectl
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    purpose: observability
+    managed-by: kubectl

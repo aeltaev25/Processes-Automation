@@ -1,0 +1,152 @@
+/**
+ * ADVANTOUR — Frontend API Service Layer
+ *
+ * All HTTP calls to the backend go through this file.
+ * Benefits:
+ *   - One place to change the base URL (dev vs staging vs prod)
+ *   - Auth token automatically attached to every request
+ *   - Token expiry handled automatically (redirect to login)
+ *   - Consistent error handling and logging
+ *
+ * USAGE IN COMPONENTS:
+ *   import { toursApi } from '../services/api';
+ *   const tours = await toursApi.list({ page: 1, limit: 20 });
+ */
+
+import axios from 'axios';
+
+// ── API Base URL ──────────────────────────────────────────────────────────────
+// React reads REACT_APP_* environment variables from:
+//   .env.development  (npm start)
+//   .env.production   (npm run build)
+// The Kubernetes Deployment ConfigMap sets REACT_APP_API_URL for each environment.
+const BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:4000/api/v1';
+
+// ── Axios Instance ────────────────────────────────────────────────────────────
+const api = axios.create({
+  baseURL: BASE_URL,
+  timeout: 30000, // 30s timeout
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+// ── Request Interceptor — attach JWT token ────────────────────────────────────
+api.interceptors.request.use(
+  (config) => {
+    const token = localStorage.getItem('access_token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+// ── Response Interceptor — handle 401 (token expired) ───────────────────────
+api.interceptors.response.use(
+  (response) => response.data, // Automatically unwrap response.data
+
+  async (error) => {
+    const originalRequest = error.config;
+
+    // If we get a 401 and haven't already tried to refresh
+    if (error.response?.status === 401 && !originalRequest._retried) {
+      originalRequest._retried = true;
+
+      try {
+        const refreshToken = localStorage.getItem('refresh_token');
+        if (!refreshToken) throw new Error('No refresh token');
+
+        // Try to get a new access token
+        const response = await axios.post(`${BASE_URL}/auth/refresh`, {
+          refresh_token: refreshToken,
+        });
+
+        const { access_token } = response.data;
+        localStorage.setItem('access_token', access_token);
+
+        // Retry the original request with the new token
+        originalRequest.headers.Authorization = `Bearer ${access_token}`;
+        return api(originalRequest);
+
+      } catch (refreshError) {
+        // Refresh failed — user must log in again
+        localStorage.removeItem('access_token');
+        localStorage.removeItem('refresh_token');
+        window.location.href = '/login';
+        return Promise.reject(refreshError);
+      }
+    }
+
+    // Extract error message from API response
+    const message = error.response?.data?.error || error.message || 'An unexpected error occurred';
+    return Promise.reject(new Error(message));
+  }
+);
+
+// ── Auth API ──────────────────────────────────────────────────────────────────
+export const authApi = {
+  login: (email, password) =>
+    api.post('/auth/login', { email, password }),
+
+  logout: () =>
+    api.post('/auth/logout'),
+
+  me: () =>
+    api.get('/auth/me'),
+};
+
+// ── Tours API ─────────────────────────────────────────────────────────────────
+export const toursApi = {
+  list: (params) =>
+    api.get('/tours', { params }),
+
+  get: (id) =>
+    api.get(`/tours/${id}`),
+
+  create: (data) =>
+    api.post('/tours', data),
+
+  update: (id, data) =>
+    api.put(`/tours/${id}`, data),
+
+  delete: (id) =>
+    api.delete(`/tours/${id}`),
+
+  getTimeline: (id) =>
+    api.get(`/tours/${id}/timeline`),
+};
+
+// ── CRM API ───────────────────────────────────────────────────────────────────
+export const crmApi = {
+  contacts: {
+    list:   (params) => api.get('/crm/contacts', { params }),
+    get:    (id)     => api.get(`/crm/contacts/${id}`),
+    create: (data)   => api.post('/crm/contacts', data),
+    update: (id, data) => api.put(`/crm/contacts/${id}`, data),
+  },
+  deals: {
+    pipeline:   ()          => api.get('/crm/pipeline'),
+    create:     (data)      => api.post('/crm/deals', data),
+    moveStage:  (id, stage) => api.patch(`/crm/deals/${id}/stage`, { stage }),
+  },
+};
+
+// ── Finance API ───────────────────────────────────────────────────────────────
+export const financeApi = {
+  accounts:    ()          => api.get('/finance/accounts'),
+  balances:    ()          => api.get('/finance/balances'),
+  postJournal: (data)      => api.post('/finance/journal', data),
+  pnlReport:   (year)      => api.get('/finance/reports/pnl', { params: { year } }),
+};
+
+// ── Operations API ────────────────────────────────────────────────────────────
+export const operationsApi = {
+  guides: {
+    list:   (params)              => api.get('/operations/guides', { params }),
+    assign: (guideId, data)       => api.post(`/operations/guides/${guideId}/assign`, data),
+  },
+};
+
+export default api;

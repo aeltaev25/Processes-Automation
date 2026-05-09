@@ -1,0 +1,85 @@
+/**
+ * ADVANTOUR — Global Error Handler Middleware
+ *
+ * Catches all errors thrown by route handlers and formats them consistently.
+ * Must be the LAST middleware in server.js (after all routes).
+ *
+ * HOW IT WORKS:
+ *   Any controller can do: throw new AppError('Not found', 404)
+ *   Or: next(error) to pass an error here.
+ *   This middleware formats it and sends a proper JSON response.
+ *
+ * IN PRODUCTION: Never expose stack traces to the client.
+ * IN DEVELOPMENT: Include stack for faster debugging.
+ */
+
+'use strict';
+
+const logger = require('../config/logger');
+
+/**
+ * AppError
+ * Custom error class with HTTP status code.
+ * Controllers should throw this for predictable errors.
+ */
+class AppError extends Error {
+  constructor(message, statusCode = 500, code = null) {
+    super(message);
+    this.statusCode = statusCode;
+    this.code       = code;    // Machine-readable error code e.g. "LEDGER_IMBALANCE"
+    this.isOperational = true; // vs programmer errors (bugs) — handled differently
+    Error.captureStackTrace(this, this.constructor);
+  }
+}
+
+/**
+ * errorHandler
+ * Express 4-argument error middleware.
+ */
+const errorHandler = (err, req, res, next) => {
+  // Default to 500 if no statusCode set
+  const statusCode = err.statusCode || 500;
+  const isDev      = process.env.NODE_ENV !== 'production';
+
+  // Log every error with trace ID so we can correlate with request logs
+  const logContext = {
+    traceId:    req.id,
+    method:     req.method,
+    path:       req.path,
+    statusCode,
+    error:      err.message,
+  };
+
+  if (statusCode >= 500) {
+    logger.error('Server error:', { ...logContext, stack: err.stack });
+  } else {
+    logger.warn('Client error:', logContext);
+  }
+
+  // Build response — never leak stack to production clients
+  const response = {
+    error:   err.message || 'An unexpected error occurred',
+    code:    err.code    || null,
+    traceId: req.id,     // Include trace ID so user can report it to support
+  };
+
+  if (isDev && err.stack) {
+    response.stack = err.stack;
+  }
+
+  // Handle specific library errors
+  if (err.name === 'ValidationError') {
+    return res.status(422).json({ error: 'Validation failed', details: err.details || err.message });
+  }
+  if (err.code === '23505') { // PostgreSQL unique violation
+    return res.status(409).json({ error: 'Record already exists (unique constraint violation)' });
+  }
+  if (err.code === '23503') { // PostgreSQL foreign key violation
+    return res.status(409).json({ error: 'Referenced record does not exist (foreign key violation)' });
+  }
+
+  res.status(statusCode).json(response);
+};
+
+module.exports = errorHandler;
+module.exports.AppError = AppError;

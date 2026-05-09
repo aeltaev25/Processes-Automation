@@ -1,0 +1,113 @@
+/**
+ * ADVANTOUR — RabbitMQ Message Queue Configuration
+ *
+ * RabbitMQ is used for async communication between microservices.
+ * e.g., when a booking is confirmed, the finance-service and
+ * notification-service are notified via events — not direct HTTP calls.
+ *
+ * This decoupling means:
+ *   - If notification-service is down, events queue up and deliver later
+ *   - Services don't need to know each other's network addresses
+ *   - You can add new consumers without changing the producer
+ *
+ * EXCHANGE TOPOLOGY:
+ *   Producer → topic exchange "advantour.events"
+ *     └─ routing key "tour.created"   → queue "finance.tour-created"
+ *     └─ routing key "tour.created"   → queue "notification.tour-created"
+ *     └─ routing key "payment.posted" → queue "finance.payment-posted"
+ */
+
+'use strict';
+
+const amqplib = require('amqplib');
+const logger  = require('./logger');
+
+const EXCHANGE_NAME = 'advantour.events';
+const EXCHANGE_TYPE = 'topic'; // Allows wildcard routing keys
+
+let connection;
+let channel;
+
+async function connectMQ() {
+  const url = process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672';
+  connection = await amqplib.connect(url);
+  channel    = await connection.createChannel();
+
+  // Declare the exchange (idempotent — safe to call on every startup)
+  await channel.assertExchange(EXCHANGE_NAME, EXCHANGE_TYPE, { durable: true });
+
+  logger.info(`RabbitMQ exchange "${EXCHANGE_NAME}" ready`);
+
+  connection.on('error', (err) => logger.error('RabbitMQ connection error:', err));
+  connection.on('close', ()    => {
+    logger.warn('RabbitMQ connection closed — attempting reconnect in 5s');
+    setTimeout(connectMQ, 5000);
+  });
+}
+
+/**
+ * publishEvent(routingKey, payload)
+ * Publishes a JSON event to the topic exchange.
+ *
+ * Usage:
+ *   await publishEvent('tour.created', { tour_id: '...', deal_id: '...' });
+ */
+async function publishEvent(routingKey, payload) {
+  if (!channel) throw new Error('MQ channel not initialized');
+
+  const message = JSON.stringify({
+    ...payload,
+    event:     routingKey,
+    timestamp: new Date().toISOString(),
+    messageId: require('crypto').randomUUID(),
+  });
+
+  const ok = channel.publish(
+    EXCHANGE_NAME,
+    routingKey,
+    Buffer.from(message),
+    { persistent: true } // Survive broker restart
+  );
+
+  if (!ok) logger.warn(`MQ back-pressure on routing key "${routingKey}"`);
+  logger.debug(`Event published: ${routingKey}`);
+}
+
+/**
+ * subscribe(queueName, routingKey, handler)
+ * Creates a queue, binds it to the exchange, and starts consuming.
+ * handler(payload) is called for each message.
+ * On success: message is acknowledged (removed from queue).
+ * On failure: message is negatively acknowledged (requeued once).
+ */
+async function subscribe(queueName, routingKey, handler) {
+  if (!channel) throw new Error('MQ channel not initialized');
+
+  // Assert the queue (creates it if it doesn't exist)
+  await channel.assertQueue(queueName, {
+    durable: true,           // Survive broker restart
+    arguments: {
+      'x-dead-letter-exchange': `${EXCHANGE_NAME}.dlx`, // Dead-letter queue for failed messages
+    },
+  });
+
+  await channel.bindQueue(queueName, EXCHANGE_NAME, routingKey);
+  channel.prefetch(10); // Process max 10 messages at a time per consumer
+
+  channel.consume(queueName, async (msg) => {
+    if (!msg) return;
+    try {
+      const payload = JSON.parse(msg.content.toString());
+      await handler(payload);
+      channel.ack(msg); // Tell RabbitMQ: processed successfully
+    } catch (err) {
+      logger.error(`Error processing MQ message on ${queueName}:`, err);
+      // requeue: false → sends to dead-letter queue instead of infinite loop
+      channel.nack(msg, false, false);
+    }
+  });
+
+  logger.info(`Subscribed to queue "${queueName}" (routing: "${routingKey}")`);
+}
+
+module.exports = { connectMQ, publishEvent, subscribe };

@@ -1,0 +1,53 @@
+/**
+ * ADVANTOUR — Centralized Logger
+ * Uses Winston with structured JSON output for production
+ * and pretty-print for development terminals.
+ *
+ * WHY JSON LOGS?
+ * In production, Kubernetes collects logs from stdout and forwards
+ * them to a log aggregator (Loki, Elasticsearch, etc.).
+ * JSON format lets you filter by field: { "level": "error", "trace_id": "..." }
+ * instead of parsing raw text with regex.
+ */
+
+'use strict';
+
+const { createLogger, format, transports } = require('winston');
+
+const { combine, timestamp, errors, json, colorize, printf } = format;
+
+// Development format: human-readable with colors
+const devFormat = combine(
+  colorize({ all: true }),
+  timestamp({ format: 'HH:mm:ss' }),
+  errors({ stack: true }),
+  printf(({ level, message, timestamp, stack }) =>
+    stack
+      ? `${timestamp} [${level}] ${message}\n${stack}`
+      : `${timestamp} [${level}] ${message}`
+  )
+);
+
+// Production format: machine-readable JSON with full timestamp
+const prodFormat = combine(
+  timestamp(),
+  errors({ stack: true }),
+  json()
+);
+
+const logger = createLogger({
+  level: process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug'),
+  format: process.env.NODE_ENV === 'production' ? prodFormat : devFormat,
+  transports: [
+    new transports.Console(),
+  ],
+  // Uncaught exceptions and unhandled promise rejections should be logged
+  // before the process exits
+  exceptionHandlers: [new transports.Console()],
+  rejectionHandlers: [new transports.Console()],
+});
+
+// Add an 'http' level (between debug and info) for Morgan request logs
+logger.http = (message) => logger.log('http', message);
+
+module.exports = logger;

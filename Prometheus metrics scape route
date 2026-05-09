@@ -1,0 +1,28 @@
+/**
+ * ADVANTOUR — Prometheus Metrics Scrape Endpoint
+ *
+ * GET /metrics
+ * Prometheus server scrapes this every 15 seconds.
+ * Returns all registered metrics in Prometheus text format.
+ *
+ * SECURITY: In production, restrict access to this endpoint
+ * at the Kubernetes NetworkPolicy level — only allow the
+ * Prometheus pod in the monitoring namespace to reach it.
+ */
+
+'use strict';
+
+const express = require('express');
+const router  = express.Router();
+const { register } = require('../middleware/metrics');
+
+router.get('/', async (req, res) => {
+  try {
+    res.set('Content-Type', register.contentType);
+    res.end(await register.metrics());
+  } catch (err) {
+    res.status(500).end(err.message);
+  }
+});
+
+module.exports = router;

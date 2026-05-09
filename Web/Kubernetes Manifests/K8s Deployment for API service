@@ -1,0 +1,185 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ADVANTOUR — Kubernetes Deployment: API Server (Production)
+#
+# This file defines HOW to run the backend API in Kubernetes:
+#   - How many replicas (pods) to run
+#   - Which Docker image to use
+#   - Resource limits (CPU/memory)
+#   - Health checks
+#   - Rolling update strategy (zero-downtime deploys)
+#
+# HOW TO DEPLOY:
+#   kubectl apply -f k8s/deployments/api-deployment.yaml
+#
+# HOW TO CHECK STATUS:
+#   kubectl get pods -n advantour-prod
+#   kubectl describe deployment advantour-api -n advantour-prod
+#
+# HOW TO VIEW LOGS:
+#   kubectl logs -l app=advantour-api -n advantour-prod --tail=100 -f
+#
+# HOW TO FORCE A RESTART (e.g., after updating a Secret):
+#   kubectl rollout restart deployment/advantour-api -n advantour-prod
+#
+# HOW TO ROLL BACK A BAD DEPLOY:
+#   kubectl rollout undo deployment/advantour-api -n advantour-prod
+# ─────────────────────────────────────────────────────────────────────────────
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: advantour-api
+  namespace: advantour-prod
+  labels:
+    app: advantour-api
+    tier: backend
+    environment: production
+spec:
+  # Run 3 replicas for high availability.
+  # Kubernetes spreads them across nodes so 1 node crash doesn't take down the service.
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: advantour-api
+
+  # Rolling update strategy: Kubernetes replaces pods one at a time.
+  # The old pod stays alive until the new one passes its readiness probe.
+  # Result: zero-downtime deployments.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # Temporarily allow 1 extra pod during deploy
+      maxUnavailable: 0  # Never allow 0 pods serving traffic
+
+  template:
+    metadata:
+      labels:
+        app: advantour-api
+        tier: backend
+        version: "1.0.0"  # Update this with each release for easy filtering
+      annotations:
+        # Prometheus will scrape metrics from this pod
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "4000"
+        prometheus.io/path:   "/metrics"
+
+    spec:
+      # Security: Don't run as root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+
+      # Spread pods across different nodes for resilience
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: advantour-api
+
+      containers:
+        - name: advantour-api
+          # In production, use your private container registry URL
+          # e.g., registry.yourdomain.com/advantour/api:1.0.0
+          image: advantour/api:latest
+
+          # Always pull latest — in prod, pin to a specific tag like :1.0.0
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 4000
+              name: http
+
+          # ── Environment Variables ──────────────────────────────────────────
+          # Non-sensitive config from ConfigMap
+          envFrom:
+            - configMapRef:
+                name: advantour-config
+
+          # Sensitive values from Secrets (injected one by one)
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: advantour-secrets
+                  key: JWT_SECRET
+
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: advantour-secrets
+                  key: DB_PASSWORD
+
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: advantour-secrets
+                  key: REDIS_PASSWORD
+
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: advantour-secrets
+                  key: RABBITMQ_URL
+
+          # ── Resource Limits ────────────────────────────────────────────────
+          # requests: minimum guaranteed resources (affects scheduling)
+          # limits:   hard cap (pod is killed if it exceeds memory limit)
+          resources:
+            requests:
+              cpu:    "100m"   # 100 millicores = 0.1 CPU core
+              memory: "256Mi"
+            limits:
+              cpu:    "500m"   # 0.5 CPU core max per pod
+              memory: "512Mi"
+
+          # ── Health Checks ──────────────────────────────────────────────────
+          # livenessProbe: restart pod if it becomes unresponsive
+          livenessProbe:
+            httpGet:
+              path: /health/liveness
+              port: 4000
+            initialDelaySeconds: 15  # Wait 15s before first check (startup time)
+            periodSeconds:       10  # Check every 10s
+            failureThreshold:    3   # Restart after 3 consecutive failures
+
+          # readinessProbe: stop sending traffic if not ready (DB/Redis issue)
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds:       10
+            failureThreshold:    3
+
+          # startupProbe: extra time for the initial startup before liveness kicks in
+          startupProbe:
+            httpGet:
+              path: /health/liveness
+              port: 4000
+            initialDelaySeconds: 0
+            periodSeconds:       5
+            failureThreshold:    12  # 12 * 5s = 60s startup budget
+
+---
+# ── Kubernetes Service — exposes the deployment inside the cluster ─────────────
+# Other pods (nginx ingress, monitoring) reach the API via:
+#   http://advantour-api-service.advantour-prod.svc.cluster.local:80
+apiVersion: v1
+kind: Service
+metadata:
+  name: advantour-api-service
+  namespace: advantour-prod
+  labels:
+    app: advantour-api
+spec:
+  selector:
+    app: advantour-api
+  ports:
+    - name: http
+      port: 80           # External port (other pods connect to :80)
+      targetPort: 4000   # Port on the pod container
+  type: ClusterIP        # Internal only — not exposed to the internet directly

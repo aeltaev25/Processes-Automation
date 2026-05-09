@@ -1,0 +1,116 @@
+/**
+ * ADVANTOUR — PostgreSQL Database Configuration
+ *
+ * Uses the 'pg' (node-postgres) library with connection pooling.
+ *
+ * WHY POOLING?
+ * Opening a PostgreSQL connection is expensive (~50ms).
+ * A pool keeps N connections open and reuses them, handling up to
+ * (pool.max) concurrent DB operations without delay.
+ *
+ * ENVIRONMENT VARIABLES (set in .env or Kubernetes Secret):
+ *   DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD,
+ *   DB_POOL_MIN (default 2), DB_POOL_MAX (default 10)
+ */
+
+'use strict';
+
+const { Pool } = require('pg');
+const logger   = require('./logger');
+
+// ── Pool singleton — created once, reused across the whole app ──────────────
+let pool;
+
+/**
+ * connectDB()
+ * Called once during server bootstrap.
+ * Tests the connection and stores the pool for later use.
+ */
+async function connectDB() {
+  pool = new Pool({
+    host:     process.env.DB_HOST     || 'localhost',
+    port:     parseInt(process.env.DB_PORT || '5432'),
+    database: process.env.DB_NAME     || 'advantour',
+    user:     process.env.DB_USER     || 'advantour_app',
+    password: process.env.DB_PASSWORD,
+    min:      parseInt(process.env.DB_POOL_MIN || '2'),   // Min idle connections
+    max:      parseInt(process.env.DB_POOL_MAX || '10'),  // Max concurrent connections
+    idleTimeoutMillis:    30000,  // Release idle connections after 30s
+    connectionTimeoutMillis: 5000, // Fail fast if DB unreachable in 5s
+
+    // SSL: Required for production / Hostinger VPS.
+    // In dev, set DB_SSL=false to disable.
+    ssl: process.env.DB_SSL === 'false' ? false : {
+      rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false',
+    },
+  });
+
+  // Log pool errors (e.g., DB restart) without crashing the process
+  pool.on('error', (err) => {
+    logger.error('Unexpected PostgreSQL pool error:', err);
+  });
+
+  // Test the connection by running a trivial query
+  const client = await pool.connect();
+  const { rows } = await client.query('SELECT NOW() AS server_time');
+  logger.info(`PostgreSQL server time: ${rows[0].server_time}`);
+  client.release(); // ALWAYS release — or the pool will starve
+}
+
+/**
+ * getDB()
+ * Returns the pool instance.
+ * Used by service files: const { getDB } = require('../config/database');
+ */
+function getDB() {
+  if (!pool) throw new Error('DB pool not initialized — call connectDB() first');
+  return pool;
+}
+
+/**
+ * query(text, params)
+ * Convenience wrapper: checks out a connection, runs the query, releases.
+ * Usage:
+ *   const { rows } = await query('SELECT * FROM tours WHERE id = $1', [id]);
+ */
+async function query(text, params) {
+  const start = Date.now();
+  const result = await pool.query(text, params);
+  const duration = Date.now() - start;
+
+  // Warn on slow queries (> 500ms) — helps identify missing indexes
+  if (duration > 500) {
+    logger.warn(`Slow query detected (${duration}ms): ${text.substring(0, 120)}`);
+  }
+
+  return result;
+}
+
+/**
+ * withTransaction(callback)
+ * Runs a series of queries inside a single DB transaction.
+ * If ANY query throws, the transaction is automatically rolled back.
+ *
+ * Usage:
+ *   await withTransaction(async (client) => {
+ *     await client.query('INSERT INTO ...', [...]);
+ *     await client.query('UPDATE ...', [...]);
+ *   });
+ */
+async function withTransaction(callback) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await callback(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    logger.error('Transaction rolled back:', err.message);
+    throw err; // Re-throw so the caller can handle / return 500
+  } finally {
+    client.release(); // Always release, even on error
+  }
+}
+
+module.exports = { connectDB, getDB, query, withTransaction };

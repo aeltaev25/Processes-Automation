@@ -1,0 +1,176 @@
+/**
+ * ADVANTOUR — Backend API Server
+ * Stack: Node.js + Express + PostgreSQL + Redis + RabbitMQ
+ * Author: Senior IT Engineering Team — Advantour
+ *
+ * PURPOSE:
+ * This is the main entry point for the Advantour API Gateway.
+ * It wires together all middleware, routes, and infrastructure
+ * connections before starting the HTTP server.
+ *
+ * HOW TO START (development):
+ *   npm run dev
+ *
+ * HOW TO START (production inside Kubernetes):
+ *   The Dockerfile sets CMD ["node", "src/server.js"]
+ *   You never run this manually in production — Kubernetes does it.
+ */
+
+'use strict';
+
+// ── 1. Load environment variables FIRST before any other import ──────────────
+require('dotenv').config();
+
+// ── 2. Core dependencies ──────────────────────────────────────────────────────
+const express       = require('express');
+const helmet        = require('helmet');          // Sets security-related HTTP headers
+const cors          = require('cors');            // Cross-Origin Resource Sharing
+const compression   = require('compression');     // gzip responses
+const morgan        = require('morgan');          // HTTP request logger
+const rateLimit     = require('express-rate-limit');
+const { v4: uuidv4 } = require('uuid');
+
+// ── 3. Internal modules ───────────────────────────────────────────────────────
+const logger          = require('./config/logger');
+const { connectDB }   = require('./config/database');
+const { connectRedis } = require('./config/redis');
+const { connectMQ }   = require('./config/rabbitmq');
+const errorHandler    = require('./middleware/errorHandler');
+const requestId       = require('./middleware/requestId');
+const metricsMiddleware = require('./middleware/metrics');
+
+// Route modules — one file per domain
+const authRoutes        = require('./routes/auth');
+const tourRoutes        = require('./routes/tours');
+const crmRoutes         = require('./routes/crm');
+const financeRoutes     = require('./routes/finance');
+const operationsRoutes  = require('./routes/operations');
+const healthRoutes      = require('./routes/health');
+const metricsRoutes     = require('./routes/metrics');
+
+// ── 4. Create the Express application ────────────────────────────────────────
+const app = express();
+
+// ── 5. Trust proxy (required when behind nginx/Kubernetes ingress) ────────────
+//    Without this, req.ip returns the load-balancer IP, not the real client IP.
+app.set('trust proxy', 1);
+
+// ── 6. Security middleware ────────────────────────────────────────────────────
+//    helmet() adds ~14 HTTP headers in one line (XSS, clickjacking, MIME-sniff, etc.)
+app.use(helmet());
+
+// CORS: Only allow our known front-end origins.
+// In production these come from environment variables set in the Kubernetes ConfigMap.
+const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000').split(',');
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS policy: origin ${origin} is not allowed`));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+}));
+
+// ── 7. Request parsing ────────────────────────────────────────────────────────
+app.use(compression());                     // Compress all responses
+app.use(express.json({ limit: '2mb' }));    // Parse JSON bodies (max 2MB)
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+
+// ── 8. Request tracing ────────────────────────────────────────────────────────
+//    Every request gets a unique ID (trace_id). This is forwarded to all
+//    downstream services and printed in every log line — critical for debugging.
+app.use(requestId);
+
+// ── 9. HTTP access logging ────────────────────────────────────────────────────
+//    Morgan format includes the X-Request-ID for log correlation.
+app.use(morgan(':method :url :status :res[content-length] - :response-time ms :req[x-request-id]', {
+  stream: { write: (message) => logger.http(message.trim()) },
+}));
+
+// ── 10. Prometheus metrics collection middleware ──────────────────────────────
+//     Records HTTP duration, status codes, path labels for Grafana dashboards.
+app.use(metricsMiddleware);
+
+// ── 11. Global rate limiting ──────────────────────────────────────────────────
+//     100 requests per IP per minute. Prevents brute-force and DDoS at app layer.
+//     Kubernetes + nginx ingress has a separate network-level limiter.
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,    // 1 minute window
+  max: 100,               // max requests per window per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests — please slow down.' },
+});
+app.use('/api/', globalLimiter);
+
+// ── 12. Mount route modules ───────────────────────────────────────────────────
+//     Each route file handles one business domain.
+//     The /health and /metrics endpoints are NOT behind auth — scrapers need them.
+app.use('/health',            healthRoutes);       // Kubernetes liveness/readiness probes
+app.use('/metrics',           metricsRoutes);      // Prometheus scrape endpoint
+
+// Versioned API — all business routes under /api/v1
+app.use('/api/v1/auth',       authRoutes);
+app.use('/api/v1/tours',      tourRoutes);
+app.use('/api/v1/crm',        crmRoutes);
+app.use('/api/v1/finance',    financeRoutes);
+app.use('/api/v1/operations', operationsRoutes);
+
+// ── 13. 404 handler — catches requests that matched no route ──────────────────
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found', path: req.originalUrl });
+});
+
+// ── 14. Global error handler — MUST be last middleware ────────────────────────
+app.use(errorHandler);
+
+// ── 15. Bootstrap: connect to infra then start listening ─────────────────────
+async function bootstrap() {
+  try {
+    logger.info('🔌 Connecting to PostgreSQL...');
+    await connectDB();
+    logger.info('✅ PostgreSQL connected');
+
+    logger.info('🔌 Connecting to Redis...');
+    await connectRedis();
+    logger.info('✅ Redis connected');
+
+    logger.info('🔌 Connecting to RabbitMQ...');
+    await connectMQ();
+    logger.info('✅ RabbitMQ connected');
+
+    const PORT = process.env.PORT || 4000;
+    const server = app.listen(PORT, () => {
+      logger.info(`🚀 Advantour API Server running on port ${PORT}`);
+      logger.info(`   Environment : ${process.env.NODE_ENV}`);
+      logger.info(`   Trace header: X-Request-ID`);
+    });
+
+    // ── 16. Graceful shutdown ─────────────────────────────────────────────────
+    //     When Kubernetes sends SIGTERM (during rolling deploy or scale-down),
+    //     we stop accepting new connections but finish in-flight requests first.
+    const shutdown = async (signal) => {
+      logger.info(`${signal} received — graceful shutdown initiated`);
+      server.close(async () => {
+        logger.info('HTTP server closed');
+        // Close DB pool, Redis, MQ connections here if needed
+        process.exit(0);
+      });
+      // Force exit after 30 seconds if something is stuck
+      setTimeout(() => process.exit(1), 30000);
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT',  () => shutdown('SIGINT'));
+
+  } catch (err) {
+    logger.error('❌ Bootstrap failed:', err);
+    process.exit(1);
+  }
+}
+
+bootstrap();
+
+module.exports = app; // Export for Jest integration tests

@@ -1,0 +1,108 @@
+/**
+ * ADVANTOUR — Authentication Middleware
+ *
+ * Verifies JWT tokens on every protected route.
+ * The token is issued by /api/v1/auth/login and must be sent
+ * in every subsequent request as:
+ *   Authorization: Bearer <token>
+ *
+ * HOW IT WORKS:
+ *   1. Extract token from the Authorization header
+ *   2. Verify signature and expiry using the JWT_SECRET
+ *   3. Check if token has been revoked (stored in Redis as a blocklist)
+ *   4. Attach decoded user object to req.user for downstream controllers
+ *
+ * ROLES (stored inside JWT payload):
+ *   admin        — full access
+ *   manager      — read/write tours, CRM, operations
+ *   sales_agent  — read/write CRM, own tours only
+ *   finance      — read/write finance module only
+ *   vendor       — limited read access (per vendor scope)
+ */
+
+'use strict';
+
+const jwt    = require('jsonwebtoken');
+const logger = require('../config/logger');
+const { getRedis } = require('../config/redis');
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET && process.env.NODE_ENV === 'production') {
+  throw new Error('JWT_SECRET environment variable is required in production');
+}
+
+/**
+ * authenticate
+ * Express middleware — attach to any route that requires a logged-in user.
+ */
+const authenticate = async (req, res, next) => {
+  try {
+    // 1. Extract token
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Missing or malformed Authorization header' });
+    }
+    const token = authHeader.slice(7); // Remove "Bearer " prefix
+
+    // 2. Verify signature and expiry
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET || 'dev-secret-change-in-prod');
+    } catch (err) {
+      if (err.name === 'TokenExpiredError') {
+        return res.status(401).json({ error: 'Token expired — please log in again' });
+      }
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    // 3. Check revocation list in Redis
+    //    When a user logs out or an admin invalidates a session, the JWT ID (jti)
+    //    is added to Redis with an expiry matching the token's remaining lifetime.
+    const redis    = getRedis();
+    const revoked  = await redis.get(`revoked_token:${decoded.jti}`);
+    if (revoked) {
+      return res.status(401).json({ error: 'Token has been revoked — please log in again' });
+    }
+
+    // 4. Attach user to request for downstream use
+    req.user = {
+      userId:   decoded.sub,
+      email:    decoded.email,
+      role:     decoded.role,
+      vendorId: decoded.vendor_id || null, // Present for vendor users
+      jti:      decoded.jti,
+    };
+
+    next();
+  } catch (err) {
+    logger.error('Auth middleware error:', err);
+    res.status(500).json({ error: 'Internal server error during authentication' });
+  }
+};
+
+/**
+ * authorize(...roles)
+ * Factory that returns a middleware checking the user's role.
+ * Must be used AFTER authenticate.
+ *
+ * Usage:
+ *   router.delete('/tours/:id',
+ *     authenticate,
+ *     authorize('admin', 'manager'),
+ *     tourController.deleteTour
+ *   );
+ */
+const authorize = (...allowedRoles) => (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+  if (!allowedRoles.includes(req.user.role)) {
+    logger.warn(`Authorization denied: user ${req.user.userId} (role: ${req.user.role}) attempted ${req.method} ${req.path}`);
+    return res.status(403).json({
+      error: `Access denied — requires one of: ${allowedRoles.join(', ')}`,
+    });
+  }
+  next();
+};
+
+module.exports = { authenticate, authorize };

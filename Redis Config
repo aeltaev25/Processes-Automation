@@ -1,0 +1,116 @@
+/**
+ * ADVANTOUR — Redis Cache Configuration
+ *
+ * Redis is used for:
+ *   1. API response caching (tour listings, CRM summaries)
+ *   2. Rate-limiting counters (per-IP request counts)
+ *   3. Session store for JWT revocation list
+ *   4. Distributed locks (prevent double-booking)
+ *
+ * ENVIRONMENT VARIABLES:
+ *   REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
+ */
+
+'use strict';
+
+const { createClient } = require('redis');
+const logger = require('./logger');
+
+let redisClient;
+
+async function connectRedis() {
+  redisClient = createClient({
+    socket: {
+      host: process.env.REDIS_HOST || 'localhost',
+      port: parseInt(process.env.REDIS_PORT || '6379'),
+      reconnectStrategy: (retries) => {
+        // Exponential backoff: wait 100ms, 200ms, 400ms, ... up to 5s
+        const delay = Math.min(retries * 100, 5000);
+        logger.info(`Redis reconnecting in ${delay}ms (attempt ${retries})`);
+        return delay;
+      },
+    },
+    password: process.env.REDIS_PASSWORD || undefined,
+  });
+
+  redisClient.on('error',   (err) => logger.error('Redis error:', err));
+  redisClient.on('connect', ()    => logger.info('Redis connection established'));
+  redisClient.on('reconnecting', () => logger.warn('Redis reconnecting...'));
+
+  await redisClient.connect();
+}
+
+function getRedis() {
+  if (!redisClient || !redisClient.isOpen) {
+    throw new Error('Redis client not connected');
+  }
+  return redisClient;
+}
+
+/**
+ * cachedQuery(key, ttlSeconds, loader)
+ *
+ * Cache-aside pattern:
+ *   1. Try to get value from Redis
+ *   2. On cache miss, call loader() to fetch from DB
+ *   3. Store result in Redis with TTL
+ *   4. Return value
+ *
+ * Usage:
+ *   const tours = await cachedQuery('tours:active', 300, () =>
+ *     query('SELECT * FROM tours WHERE status = $1', ['active'])
+ *   );
+ */
+async function cachedQuery(key, ttlSeconds, loader) {
+  const redis  = getRedis();
+  const cached = await redis.get(key);
+
+  if (cached) {
+    return JSON.parse(cached); // Cache HIT
+  }
+
+  const result = await loader(); // Cache MISS — go to DB
+  await redis.setEx(key, ttlSeconds, JSON.stringify(result));
+  return result;
+}
+
+/**
+ * invalidateCache(pattern)
+ * Deletes all Redis keys matching a glob pattern.
+ * Call this whenever underlying data changes.
+ * e.g., invalidateCache('tours:*') after a tour is updated.
+ */
+async function invalidateCache(pattern) {
+  const redis = getRedis();
+  const keys  = await redis.keys(pattern);
+  if (keys.length > 0) {
+    await redis.del(keys);
+    logger.info(`Cache invalidated: ${keys.length} key(s) matching "${pattern}"`);
+  }
+}
+
+/**
+ * acquireLock(key, ttlMs)
+ * Simple distributed lock using Redis SET NX (Set if Not eXists).
+ * Used to prevent race conditions, e.g., two simultaneous booking requests
+ * for the same tour slot.
+ * Returns: lockId (string) on success, null if lock already held.
+ */
+async function acquireLock(key, ttlMs = 10000) {
+  const redis  = getRedis();
+  const lockId = `lock:${key}:${Date.now()}`;
+  const ok     = await redis.set(`lock:${key}`, lockId, { NX: true, PX: ttlMs });
+  return ok ? lockId : null;
+}
+
+async function releaseLock(key, lockId) {
+  const redis   = getRedis();
+  const current = await redis.get(`lock:${key}`);
+  if (current === lockId) {
+    await redis.del(`lock:${key}`);
+    return true;
+  }
+  return false; // Lock was already expired or taken by someone else
+}
+
+module.exports = { connectRedis, getRedis, cachedQuery, invalidateCache, acquireLock, releaseLock };

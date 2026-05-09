@@ -1,0 +1,72 @@
+/**
+ * ADVANTOUR — Health Check Routes
+ *
+ * Kubernetes uses these endpoints to determine pod health:
+ *
+ *   GET /health/liveness
+ *     → Returns 200 if the process is alive.
+ *     → Kubernetes restarts the pod if this returns non-200.
+ *     → Should be VERY fast — never block on DB here.
+ *
+ *   GET /health/readiness
+ *     → Returns 200 only if the app is ready to serve traffic.
+ *     → Checks DB and Redis connectivity.
+ *     → Kubernetes stops sending traffic to the pod if this fails.
+ *     → During startup, this returns 503 until all connections are ready.
+ *
+ *   GET /health/startup
+ *     → Used during initial container startup (longer timeout allowed).
+ */
+
+'use strict';
+
+const express  = require('express');
+const router   = express.Router();
+const { getDB } = require('../config/database');
+const { getRedis } = require('../config/redis');
+const logger   = require('../config/logger');
+
+// GET /health/liveness — is the process running?
+router.get('/liveness', (req, res) => {
+  res.json({ status: 'alive', uptime: process.uptime() });
+});
+
+// GET /health/readiness — is the app ready to serve requests?
+router.get('/readiness', async (req, res) => {
+  const checks = {};
+  let allHealthy = true;
+
+  // Check PostgreSQL
+  try {
+    await getDB().query('SELECT 1');
+    checks.postgresql = { status: 'ok' };
+  } catch (err) {
+    checks.postgresql = { status: 'error', message: err.message };
+    allHealthy = false;
+  }
+
+  // Check Redis
+  try {
+    await getRedis().ping();
+    checks.redis = { status: 'ok' };
+  } catch (err) {
+    checks.redis = { status: 'error', message: err.message };
+    allHealthy = false;
+  }
+
+  const statusCode = allHealthy ? 200 : 503;
+  if (!allHealthy) {
+    logger.warn('Readiness check failed:', checks);
+  }
+
+  res.status(statusCode).json({
+    status: allHealthy ? 'ready' : 'not_ready',
+    checks,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// GET /health — shortcut alias used by some load balancers
+router.get('/', (req, res) => res.json({ status: 'ok' }));
+
+module.exports = router;

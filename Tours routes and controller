@@ -1,0 +1,31 @@
+/**
+ * ADVANTOUR — Tours Routes
+ *
+ * Endpoint map:
+ *   GET    /api/v1/tours              — list all tours (paginated, cached)
+ *   GET    /api/v1/tours/:id          — get single tour
+ *   POST   /api/v1/tours              — create new tour  [manager, admin]
+ *   PUT    /api/v1/tours/:id          — update tour      [manager, admin]
+ *   DELETE /api/v1/tours/:id          — soft-delete tour [admin]
+ *   GET    /api/v1/tours/:id/timeline — get tour timeline / saga state
+ */
+
+'use strict';
+
+const express = require('express');
+const router  = express.Router();
+const { authenticate, authorize } = require('../middleware/auth');
+const tourController = require('../controllers/tourController');
+const { validate, tourSchema } = require('../middleware/validate');
+
+// Public (no auth) — if you want to expose tour catalog publicly, remove authenticate here
+router.get('/', authenticate, tourController.listTours);
+router.get('/:id', authenticate, tourController.getTour);
+router.get('/:id/timeline', authenticate, tourController.getTourTimeline);
+
+// Write operations — require manager or admin role
+router.post('/', authenticate, authorize('admin', 'manager'), validate(tourSchema.create), tourController.createTour);
+router.put('/:id', authenticate, authorize('admin', 'manager'), validate(tourSchema.update), tourController.updateTour);
+router.delete('/:id', authenticate, authorize('admin'), tourController.deleteTour);
+
+module.exports = router;

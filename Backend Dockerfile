@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ADVANTOUR — Backend Dockerfile
+# Multi-stage build: builder stage installs deps, final stage is minimal image.
+#
+# WHY MULTI-STAGE?
+# The builder image (~800MB) has compilers and dev tools to install npm packages.
+# The final image (~200MB) has ONLY the runtime — no compilers, no npm cache.
+# Smaller image = faster deploy, smaller attack surface.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: Builder ──────────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy dependency manifests FIRST (Docker layer caching optimization).
+# If package.json doesn't change, this layer is cached and npm install is skipped.
+COPY package*.json ./
+
+# Install ONLY production dependencies
+RUN npm ci --only=production
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM node:20-alpine AS runtime
+
+# Security: Run as non-root user. If an attacker exploits the app,
+# they get a low-privilege user, not root.
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+WORKDIR /app
+
+# Copy node_modules from builder (avoids re-installing in runtime stage)
+COPY --from=builder /app/node_modules ./node_modules
+
+# Copy application source code
+COPY src/ ./src/
+COPY package.json ./
+
+# Set ownership to our non-root user
+RUN chown -R appuser:appgroup /app
+
+# Switch to non-root user
+USER appuser
+
+# Expose API port (Kubernetes Service maps this to whatever internal port it wants)
+EXPOSE 4000
+
+# Health check: Docker and Kubernetes can use this to know if the container is healthy.
+# Checks every 30s; 3 consecutive failures = unhealthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- http://localhost:4000/health/liveness || exit 1
+
+# Start the application
+CMD ["node", "src/server.js"]

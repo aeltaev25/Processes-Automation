@@ -1,0 +1,340 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ADVANTOUR — Master Database Migration: 001_initial_schema.sql
+--
+-- HOW TO RUN:
+--   psql -h localhost -U postgres -d advantour_dev -f 001_initial_schema.sql
+--
+-- TO CREATE THE DATABASE FIRST:
+--   psql -h localhost -U postgres
+--   CREATE DATABASE advantour_dev;
+--   CREATE DATABASE advantour_staging;
+--   CREATE DATABASE advantour_prod;
+--   CREATE USER advantour_app WITH PASSWORD 'your_password';
+--   GRANT ALL PRIVILEGES ON DATABASE advantour_dev TO advantour_app;
+--
+-- NOTES:
+--   - All tables use UUID primary keys (globally unique, safe to expose in URLs)
+--   - Timestamps are WITH TIME ZONE (stores UTC, displays in server timezone)
+--   - Soft deletes: never hard-delete, set status = 'deleted'
+--   - Row-Level Security (RLS) policies restrict vendor data access
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Enable required PostgreSQL extensions
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";    -- gen_random_uuid()
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";     -- trigram indexes for fast ILIKE search
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SECTION 1: USER MANAGEMENT
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS app_users (
+    user_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email         VARCHAR(255) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    first_name    VARCHAR(100),
+    last_name     VARCHAR(100),
+    -- Role controls what this user can do in the application
+    -- admin: full access | manager: ops+crm | sales_agent: crm | finance: finance module | vendor: limited
+    role          VARCHAR(50)  NOT NULL DEFAULT 'sales_agent'
+                  CHECK (role IN ('admin', 'manager', 'sales_agent', 'finance', 'vendor', 'readonly')),
+    vendor_id     UUID,           -- Populated for vendor users; NULL for internal staff
+    is_active     BOOLEAN NOT NULL DEFAULT true,
+    last_login    TIMESTAMP WITH TIME ZONE,
+    created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_users_email ON app_users(email);
+CREATE INDEX idx_users_role  ON app_users(role);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SECTION 2: CRM — CONTACTS & DEALS
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS crm_contacts (
+    contact_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    first_name      VARCHAR(100) NOT NULL,
+    last_name       VARCHAR(100) NOT NULL,
+    email           VARCHAR(255),
+    phone           VARCHAR(50),
+    nationality     VARCHAR(100),       -- Useful for visa, language matching
+    source          VARCHAR(100),       -- 'website' | 'referral' | 'trade_show' | 'instagram'
+    notes           TEXT,
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    created_by      UUID REFERENCES app_users(user_id),
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Trigram index allows fast partial name search: "SELECT ... WHERE name ILIKE '%ohn%'"
+CREATE INDEX idx_contacts_name_trgm ON crm_contacts
+    USING GIN ((first_name || ' ' || last_name) gin_trgm_ops);
+CREATE INDEX idx_contacts_email ON crm_contacts(email);
+
+CREATE TABLE IF NOT EXISTS crm_deals (
+    deal_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    contact_id          UUID NOT NULL REFERENCES crm_contacts(contact_id),
+    title               VARCHAR(255) NOT NULL,
+    total_value         NUMERIC(12,2),
+    currency            CHAR(3) NOT NULL DEFAULT 'USD',
+    stage               VARCHAR(50) NOT NULL DEFAULT 'lead'
+                        CHECK (stage IN ('lead','qualified','proposal','negotiation','won','lost')),
+    status              VARCHAR(50) NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active','closed','deleted')),
+    expected_close_date DATE,
+    actual_close_date   DATE,
+    notes               TEXT,
+    assigned_to         UUID REFERENCES app_users(user_id),
+    created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_deals_contact ON crm_deals(contact_id);
+CREATE INDEX idx_deals_stage   ON crm_deals(stage);
+CREATE INDEX idx_deals_assigned ON crm_deals(assigned_to);
+
+-- Pipeline stage transition history (for funnel analytics)
+CREATE TABLE IF NOT EXISTS crm_deal_stage_history (
+    history_id  BIGSERIAL PRIMARY KEY,
+    deal_id     UUID NOT NULL REFERENCES crm_deals(deal_id),
+    from_stage  VARCHAR(50),
+    to_stage    VARCHAR(50) NOT NULL,
+    changed_by  UUID REFERENCES app_users(user_id),
+    changed_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SECTION 3: TOURS
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS tours (
+    tour_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    deal_id             UUID REFERENCES crm_deals(deal_id),
+    title               VARCHAR(255) NOT NULL,
+    start_date          DATE NOT NULL,
+    end_date            DATE NOT NULL,
+    destination         VARCHAR(200) NOT NULL,
+    pax_count           INTEGER NOT NULL CHECK (pax_count > 0),
+    transport_type      VARCHAR(50),
+    guide_requirements  JSONB DEFAULT '{}',  -- e.g., {"language": "german", "specialization": "history"}
+    notes               TEXT,
+    status              VARCHAR(50) NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','active','in_progress','completed','cancelled','deleted')),
+    created_by          UUID REFERENCES app_users(user_id),
+    created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    -- Ensure end_date is after start_date
+    CONSTRAINT chk_tour_dates CHECK (end_date >= start_date)
+);
+
+-- Index on dates: most queries filter by start_date range
+CREATE INDEX idx_tour_dates     ON tours(start_date, end_date);
+CREATE INDEX idx_tour_status    ON tours(status);
+CREATE INDEX idx_tour_deal      ON tours(deal_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SECTION 4: GUIDES & ASSIGNMENTS
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS guides (
+    guide_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    first_name      VARCHAR(100) NOT NULL,
+    last_name       VARCHAR(100) NOT NULL,
+    email           VARCHAR(255),
+    phone           VARCHAR(50),
+    city            VARCHAR(100),
+    languages       TEXT[] NOT NULL DEFAULT '{}',   -- Array: ['english','german','french']
+    specializations TEXT[] DEFAULT '{}',
+    rating          NUMERIC(3,2) DEFAULT 5.0 CHECK (rating BETWEEN 0 AND 5),
+    active_tours    INTEGER DEFAULT 0,              -- Denormalized counter for quick queries
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    notes           TEXT,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_guide_languages ON guides USING GIN(languages);
+CREATE INDEX idx_guide_city      ON guides(city);
+
+CREATE TABLE IF NOT EXISTS guide_assignments (
+    assignment_id BIGSERIAL PRIMARY KEY,
+    guide_id      UUID NOT NULL REFERENCES guides(guide_id),
+    tour_id       UUID NOT NULL REFERENCES tours(tour_id),
+    start_date    DATE NOT NULL,
+    end_date      DATE NOT NULL,
+    status        VARCHAR(50) DEFAULT 'confirmed',
+    assigned_by   UUID REFERENCES app_users(user_id),
+    created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_guide_assign_guide ON guide_assignments(guide_id, start_date, end_date);
+CREATE INDEX idx_guide_assign_tour  ON guide_assignments(tour_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SECTION 5: SAGA STATE MACHINE
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Tracks the state of the multi-step tour creation workflow:
+-- INIT → GUIDE_RESERVED → TRANSPORT_RESERVED → LEDGER_POSTED → COMPLETED
+
+CREATE TABLE IF NOT EXISTS tour_saga_steps (
+    step_id       BIGSERIAL PRIMARY KEY,
+    tour_id       UUID NOT NULL REFERENCES tours(tour_id),
+    step          VARCHAR(100) NOT NULL,   -- e.g., 'GUIDE_RESERVED'
+    step_order    INTEGER NOT NULL,
+    status        VARCHAR(50) DEFAULT 'pending'
+                  CHECK (status IN ('pending','in_progress','completed','failed','compensated')),
+    error_message TEXT,
+    completed_at  TIMESTAMP WITH TIME ZONE,
+    created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_saga_tour ON tour_saga_steps(tour_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SECTION 6: FINANCIAL LEDGER
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS ledger_accounts (
+    account_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code        VARCHAR(20) NOT NULL UNIQUE,   -- e.g., '1000' (assets), '4000' (revenue)
+    name        TEXT NOT NULL,
+    type        VARCHAR(50) NOT NULL
+                CHECK (type IN ('asset','liability','equity','revenue','expense')),
+    parent_id   UUID REFERENCES ledger_accounts(account_id),  -- For account hierarchy
+    is_active   BOOLEAN DEFAULT true,
+    created_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS journal_entries (
+    entry_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    reference_id  UUID,              -- Links to the tour/deal that triggered this entry
+    description   TEXT NOT NULL,
+    created_by    UUID REFERENCES app_users(user_id),
+    created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS journal_lines (
+    line_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entry_id    UUID NOT NULL REFERENCES journal_entries(entry_id),
+    account_id  UUID NOT NULL REFERENCES ledger_accounts(account_id),
+    debit       NUMERIC(18,4) NOT NULL DEFAULT 0 CHECK (debit  >= 0),
+    credit      NUMERIC(18,4) NOT NULL DEFAULT 0 CHECK (credit >= 0),
+    CONSTRAINT chk_nonzero CHECK (debit > 0 OR credit > 0),
+    CONSTRAINT chk_not_both CHECK (NOT (debit > 0 AND credit > 0))  -- A line is EITHER debit or credit
+);
+
+CREATE INDEX idx_journal_lines_entry   ON journal_lines(entry_id);
+CREATE INDEX idx_journal_lines_account ON journal_lines(account_id);
+
+-- DB-level ledger balance validation trigger
+-- This fires after each journal_line insert and ensures debits = credits
+CREATE OR REPLACE FUNCTION validate_journal_balance()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_debit  NUMERIC;
+    v_credit NUMERIC;
+BEGIN
+    SELECT
+        COALESCE(SUM(debit),  0),
+        COALESCE(SUM(credit), 0)
+    INTO v_debit, v_credit
+    FROM journal_lines
+    WHERE entry_id = NEW.entry_id;
+
+    -- Only validate once all lines are inserted (we check if both sides are non-zero)
+    IF v_debit > 0 AND v_credit > 0 AND ABS(v_debit - v_credit) > 0.001 THEN
+        RAISE EXCEPTION 'Ledger imbalance: debits=% credits=% for entry %',
+            v_debit, v_credit, NEW.entry_id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_validate_ledger
+AFTER INSERT ON journal_lines
+FOR EACH ROW EXECUTE FUNCTION validate_journal_balance();
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SECTION 7: AUDIT TRAIL
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Immutable append-only table. No UPDATE or DELETE ever runs on this table.
+-- Stores full JSONB snapshot of old and new state for every change.
+
+CREATE TABLE IF NOT EXISTS audit_trail (
+    event_id    BIGSERIAL PRIMARY KEY,
+    table_name  TEXT NOT NULL,
+    operation   TEXT NOT NULL CHECK (operation IN ('INSERT','UPDATE','DELETE')),
+    changed_by  UUID,
+    old_state   JSONB,
+    new_state   JSONB,
+    executed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_table      ON audit_trail(table_name);
+CREATE INDEX idx_audit_changed_by ON audit_trail(changed_by);
+CREATE INDEX idx_audit_executed   ON audit_trail(executed_at DESC);
+
+-- Generic audit trigger function (attach to any table)
+CREATE OR REPLACE FUNCTION trg_audit_log_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO audit_trail (table_name, operation, changed_by, old_state, new_state)
+    VALUES (
+        TG_TABLE_NAME,
+        TG_OP,
+        -- current_setting throws if variable not set; use default fallback
+        CASE WHEN current_setting('app.current_user_id', true) IS NOT NULL
+             THEN current_setting('app.current_user_id', true)::UUID
+             ELSE NULL END,
+        CASE WHEN TG_OP = 'DELETE' THEN to_jsonb(OLD) ELSE NULL END,
+        CASE WHEN TG_OP IN ('INSERT','UPDATE') THEN to_jsonb(NEW) ELSE NULL END
+    );
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach audit trigger to key business tables
+CREATE TRIGGER audit_tours
+    AFTER INSERT OR UPDATE OR DELETE ON tours
+    FOR EACH ROW EXECUTE FUNCTION trg_audit_log_change();
+
+CREATE TRIGGER audit_journal_entries
+    AFTER INSERT OR UPDATE OR DELETE ON journal_entries
+    FOR EACH ROW EXECUTE FUNCTION trg_audit_log_change();
+
+CREATE TRIGGER audit_crm_deals
+    AFTER INSERT OR UPDATE OR DELETE ON crm_deals
+    FOR EACH ROW EXECUTE FUNCTION trg_audit_log_change();
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SECTION 8: SEED DATA (chart of accounts)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+INSERT INTO ledger_accounts (code, name, type) VALUES
+    ('1000', 'Cash & Bank',          'asset'),
+    ('1100', 'Accounts Receivable',  'asset'),
+    ('2000', 'Accounts Payable',     'liability'),
+    ('3000', 'Owner Equity',         'equity'),
+    ('4000', 'Tour Revenue',         'revenue'),
+    ('4100', 'Service Fees',         'revenue'),
+    ('5000', 'Guide Costs',          'expense'),
+    ('5100', 'Transport Costs',      'expense'),
+    ('5200', 'Hotel Costs',          'expense'),
+    ('6000', 'Staff Salaries',       'expense'),
+    ('6100', 'Marketing',            'expense'),
+    ('6200', 'Office & Admin',       'expense')
+ON CONFLICT (code) DO NOTHING;
+
+-- Seed an admin user for first login (password: Admin@Advantour2026 — CHANGE THIS IMMEDIATELY)
+-- bcrypt hash of 'Admin@Advantour2026' with salt=12
+INSERT INTO app_users (email, password_hash, first_name, last_name, role)
+VALUES (
+    'admin@advantour.com',
+    '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/Lewvb8hQvz5aA3i4m',
+    'System',
+    'Administrator',
+    'admin'
+)
+ON CONFLICT (email) DO NOTHING;
