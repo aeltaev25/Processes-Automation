@@ -1,15 +1,64 @@
 /**
  * ADVANTOUR — Operations Routes
- * Guide assignment, transport management, saga state queries.
+ * Guide assignment, transport booking, document generation, and handoffs.
  */
 
 'use strict';
 
 const express = require('express');
-const router  = express.Router();
-const { authenticate, authorize } = require('../middleware/auth');
-const { query } = require('../config/database');
-const { AppError } = require('../middleware/errorHandler');
+const router = express.Router();
+const { authenticate, authorize } = require('./JWT auth Middleware');
+const { query, withTransaction } = require('./Database Config with connection pooling');
+const { AppError } = require('./Error handler and request ID middleware');
+const { publishEvent } = require('./RabbitMQ connection config');
+const bookingProvider = require('./Booking provider integration');
+const documentService = require('./Document generation and invoicing');
+const logger = require('./Logger config using Winston');
+
+const BOOKING_STEP_ORDER = {
+  guide: 1,
+  hotel: 2,
+  transport: 3,
+  flight: 4,
+};
+
+// GET /api/v1/operations/availability/providers — provider discovery
+router.get('/availability/providers', authenticate, async (req, res, next) => {
+  try {
+    const { service_type, city } = req.query;
+    const validServices = ['hotel', 'flight', 'transport', 'guide'];
+
+    if (!service_type || !validServices.includes(service_type)) {
+      throw new AppError('service_type must be one of hotel, flight, transport, guide', 400);
+    }
+
+    if (service_type === 'guide') {
+      const queryText = `
+        SELECT guide_id AS id, first_name, last_name, languages, city, rating, is_active
+        FROM guides
+        WHERE is_active = true
+        ORDER BY rating DESC
+      `;
+      const guides = await query(queryText);
+      return res.json({ providers: guides.rows });
+    }
+
+    const providers = await query(
+      `SELECT provider_id AS id, name, service_type, country, active, details
+       FROM third_party_providers
+       WHERE service_type = $1 AND active = true`,
+      [service_type]
+    );
+
+    if (providers.rows.length > 0) {
+      return res.json({ providers: providers.rows });
+    }
+
+    return res.json({ providers: bookingProvider.getAvailableProviders(service_type, { city }) });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // GET /api/v1/operations/guides — list available guides
 router.get('/guides', authenticate, async (req, res, next) => {
@@ -53,7 +102,6 @@ router.post('/guides/:guideId/assign', authenticate, authorize('admin', 'manager
     const { guideId } = req.params;
     const { tour_id, start_date, end_date } = req.body;
 
-    // Check for scheduling conflicts
     const conflict = await query(
       `SELECT 1 FROM guide_assignments
        WHERE guide_id = $1
@@ -73,7 +121,282 @@ router.post('/guides/:guideId/assign', authenticate, authorize('admin', 'manager
       [guideId, tour_id, start_date, end_date, req.user.userId]
     );
 
+    await publishEvent('tour.guide.assigned', {
+      tour_id: tour_id,
+      guide_id: guideId,
+      assigned_by: req.user.userId,
+    });
+
     res.status(201).json(result.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/v1/operations/tours/:tourId/bookings — reserve service for a tour
+router.post('/tours/:tourId/bookings', authenticate, authorize('admin', 'manager'), async (req, res, next) => {
+  try {
+    const { tourId } = req.params;
+    const {
+      service_type,
+      provider_id,
+      start_date,
+      end_date,
+      pax_count,
+      service_details = {},
+      cost,
+      currency = 'USD',
+    } = req.body;
+
+    const validServices = ['guide', 'hotel', 'transport', 'flight'];
+    if (!service_type || !validServices.includes(service_type)) {
+      throw new AppError('service_type must be guide, hotel, transport or flight', 400);
+    }
+
+    const tourResult = await query(`SELECT * FROM tours WHERE tour_id = $1 AND status != 'deleted'`, [tourId]);
+    const tour = tourResult.rows[0];
+    if (!tour) {
+      throw new AppError('Tour not found', 404);
+    }
+
+    const booking = await withTransaction(async (client) => {
+      const providerResult = service_type === 'guide'
+        ? null
+        : await client.query(`SELECT provider_id, name FROM third_party_providers WHERE provider_id = $1 AND active = true`, [provider_id]);
+
+      if (service_type !== 'guide' && (!providerResult || providerResult.rows.length === 0)) {
+        throw new AppError('Selected provider is not available for this service', 404);
+      }
+
+      if (service_type === 'guide') {
+        const conflict = await client.query(
+          `SELECT 1 FROM guide_assignments
+           WHERE guide_id = $1
+             AND NOT (end_date < $2 OR start_date > $3)
+           LIMIT 1`,
+          [provider_id, start_date, end_date]
+        );
+
+        if (conflict.rows.length > 0) {
+          throw new AppError('Guide is unavailable for the requested dates', 409);
+        }
+
+        const assignment = await client.query(
+          `INSERT INTO guide_assignments (guide_id, tour_id, start_date, end_date, assigned_by)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING *`,
+          [provider_id, tourId, start_date, end_date, req.user.userId]
+        );
+
+        const bookingResult = await client.query(
+          `INSERT INTO tour_bookings
+             (tour_id, service_type, provider_id, provider_reference, service_details, start_date, end_date, pax_count, cost, currency, status, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+           RETURNING *`,
+          [
+            tourId,
+            service_type,
+            provider_id,
+            `GUIDE-${provider_id}-${Date.now()}`,
+            JSON.stringify(service_details),
+            start_date,
+            end_date,
+            pax_count || tour.pax_count,
+            parseFloat(cost || 0),
+            currency,
+            'confirmed',
+            req.user.userId,
+          ]
+        );
+
+        return { ...bookingResult.rows[0], assignment: assignment.rows[0] };
+      }
+
+      const provider = providerResult.rows[0];
+      const externalBooking = await bookingProvider.reserveService({
+        serviceType: service_type,
+        providerId: provider.provider_id,
+        tourId,
+        startDate: start_date,
+        endDate: end_date,
+        paxCount: pax_count || tour.pax_count,
+        details: service_details,
+        cost,
+        currency,
+      });
+
+      const bookingResult = await client.query(
+        `INSERT INTO tour_bookings
+           (tour_id, service_type, provider_id, provider_reference, provider_name, service_details, start_date, end_date, pax_count, cost, currency, status, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         RETURNING *`,
+        [
+          tourId,
+          service_type,
+          provider.provider_id,
+          externalBooking.provider_reference,
+          externalBooking.provider_name,
+          JSON.stringify(service_details),
+          start_date,
+          end_date,
+          pax_count || tour.pax_count,
+          parseFloat(externalBooking.cost || cost || 0),
+          currency,
+          externalBooking.status,
+          req.user.userId,
+        ]
+      );
+
+      return bookingResult.rows[0];
+    });
+
+    await publishEvent('tour.booking.created', {
+      tour_id: tourId,
+      service_type,
+      booking_id: booking.booking_id,
+      created_by: req.user.userId,
+    });
+
+    res.status(201).json(booking);
+  } catch (err) {
+    logger.error('Booking creation failed:', err);
+    next(err);
+  }
+});
+
+// GET /api/v1/operations/tours/:tourId/bookings — list tour bookings
+router.get('/tours/:tourId/bookings', authenticate, authorize('admin', 'manager'), async (req, res, next) => {
+  try {
+    const { tourId } = req.params;
+    const result = await query(
+      `SELECT * FROM tour_bookings WHERE tour_id = $1 ORDER BY created_at DESC`,
+      [tourId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/v1/operations/tours/:tourId/documents — generate itinerary or invoice documents
+router.post('/tours/:tourId/documents', authenticate, authorize('admin', 'manager', 'finance'), async (req, res, next) => {
+  try {
+    const { tourId } = req.params;
+    const { type } = req.body;
+    const supported = ['itinerary', 'invoice'];
+
+    if (!supported.includes(type)) {
+      throw new AppError('Document type must be itinerary or invoice', 400);
+    }
+
+    const tourResult = await query(`SELECT * FROM tours WHERE tour_id = $1`, [tourId]);
+    const tour = tourResult.rows[0];
+    if (!tour) {
+      throw new AppError('Tour not found', 404);
+    }
+
+    const bookings = (await query(`SELECT * FROM tour_bookings WHERE tour_id = $1 ORDER BY created_at ASC`, [tourId])).rows;
+    if (bookings.length === 0 && type === 'itinerary') {
+      throw new AppError('Cannot generate itinerary without bookings in place', 422);
+    }
+
+    let document;
+    if (type === 'itinerary') {
+      document = await documentService.createItineraryDocumentRecord(tour, bookings, req.user.userId);
+    } else {
+      const lines = bookings.map((booking, index) => ({
+        description: `${booking.service_type} reservation`,
+        quantity: booking.pax_count || 1,
+        amount: booking.cost || 0,
+        currency: booking.currency || 'USD',
+        line_number: index + 1,
+      }));
+
+      const invoice = {
+        invoice_number: `INV-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(Math.random() * 10000)}`,
+        tour_id: tourId,
+        created_by: req.user.userId,
+        issued_at: new Date().toISOString(),
+        due_date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        currency: bookings.length > 0 ? bookings[0].currency : 'USD',
+      };
+
+      document = await documentService.createInvoiceDocumentRecord(tourId, invoice, lines, req.user.userId);
+    }
+
+    await publishEvent('tour.document.generated', {
+      tour_id: tourId,
+      document_id: document.document_id,
+      type,
+      created_by: req.user.userId,
+    });
+
+    res.status(201).json(document);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/v1/operations/tours/:tourId/documents — list tour documents
+router.get('/tours/:tourId/documents', authenticate, authorize('admin', 'manager', 'finance'), async (req, res, next) => {
+  try {
+    const { tourId } = req.params;
+    const result = await query(
+      `SELECT document_id, type, status, title, generated_by, generated_at, file_url
+       FROM tour_documents
+       WHERE tour_id = $1
+       ORDER BY generated_at DESC`,
+      [tourId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/v1/operations/tours/:tourId/handoff — create a cross-team handoff entry
+router.post('/tours/:tourId/handoff', authenticate, authorize('admin', 'manager'), async (req, res, next) => {
+  try {
+    const { tourId } = req.params;
+    const { from_team, to_team, notes, next_status } = req.body;
+
+    if (!from_team || !to_team) {
+      throw new AppError('from_team and to_team are required for handoff', 400);
+    }
+
+    const result = await query(
+      `INSERT INTO tour_handoffs (tour_id, from_team, to_team, notes, status, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [tourId, from_team, to_team, notes || '', 'pending', req.user.userId]
+    );
+
+    if (next_status) {
+      await query(`UPDATE tours SET status = $1, updated_at = NOW() WHERE tour_id = $2`, [next_status, tourId]);
+    }
+
+    await publishEvent('tour.handoff.created', {
+      tour_id: tourId,
+      from_team,
+      to_team,
+      handoff_id: result.rows[0].handoff_id,
+    });
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/v1/operations/tours/:tourId/handoff — list handoff history for a tour
+router.get('/tours/:tourId/handoff', authenticate, authorize('admin', 'manager', 'finance'), async (req, res, next) => {
+  try {
+    const { tourId } = req.params;
+    const result = await query(
+      `SELECT * FROM tour_handoffs WHERE tour_id = $1 ORDER BY created_at DESC`,
+      [tourId]
+    );
+    res.json(result.rows);
   } catch (err) {
     next(err);
   }

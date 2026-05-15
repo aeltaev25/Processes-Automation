@@ -11,16 +11,22 @@
  *   POST /api/v1/finance/journal           — post new journal entry
  *   GET  /api/v1/finance/balances          — account balances
  *   GET  /api/v1/finance/reports/pnl       — P&L summary
+ *   GET  /api/v1/finance/invoices          — invoice list
+ *   POST /api/v1/finance/invoices         — create invoice
+ *   POST /api/v1/finance/invoices/from-tour — auto-generate invoice from tour bookings
+ *   POST /api/v1/finance/invoices/:invoiceId/documents — generate invoice document
  */
 
 'use strict';
 
 const express = require('express');
 const router  = express.Router();
-const { authenticate, authorize } = require('../middleware/auth');
-const { withTransaction, query } = require('../config/database');
-const { AppError } = require('../middleware/errorHandler');
-const logger = require('../config/logger');
+const { authenticate, authorize } = require('./JWT auth Middleware');
+const { withTransaction, query } = require('./Database Config with connection pooling');
+const { AppError } = require('./Error handler and request ID middleware');
+const { publishEvent } = require('./RabbitMQ connection config');
+const documentService = require('./Document generation and invoicing');
+const logger = require('./Logger config using Winston');
 
 // Only finance role and admin can access these routes
 const financeAuth = [authenticate, authorize('admin', 'finance')];
@@ -51,8 +57,6 @@ router.post('/journal', ...financeAuth, async (req, res, next) => {
       throw new AppError('Journal entry requires at least 2 lines (debit and credit)', 400);
     }
 
-    // Validate double-entry balance IN THE APPLICATION (belt-and-suspenders;
-    // the DB trigger is the authoritative check)
     const totalDebit  = lines.reduce((sum, l) => sum + parseFloat(l.debit  || 0), 0);
     const totalCredit = lines.reduce((sum, l) => sum + parseFloat(l.credit || 0), 0);
 
@@ -65,7 +69,6 @@ router.post('/journal', ...financeAuth, async (req, res, next) => {
     }
 
     const entry = await withTransaction(async (client) => {
-      // 1. Create the journal entry header
       const entryResult = await client.query(
         `INSERT INTO journal_entries (reference_id, description, created_by)
          VALUES ($1, $2, $3)
@@ -74,7 +77,6 @@ router.post('/journal', ...financeAuth, async (req, res, next) => {
       );
       const journalEntry = entryResult.rows[0];
 
-      // 2. Insert each line
       for (const line of lines) {
         await client.query(
           `INSERT INTO journal_lines (entry_id, account_id, debit, credit)
@@ -84,9 +86,6 @@ router.post('/journal', ...financeAuth, async (req, res, next) => {
            parseFloat(line.credit || 0)]
         );
       }
-
-      // The DB trigger validate_journal_balance() fires here and
-      // will ROLLBACK the entire transaction if debits ≠ credits.
 
       return journalEntry;
     });
@@ -123,7 +122,6 @@ router.get('/balances', ...financeAuth, async (req, res, next) => {
 });
 
 // ── GET /api/v1/finance/reports/pnl ─────────────────────────────────────────
-//    Returns monthly P&L summary for dashboards / executive reporting.
 router.get('/reports/pnl', ...financeAuth, async (req, res, next) => {
   try {
     const year = parseInt(req.query.year || new Date().getFullYear());
@@ -144,6 +142,178 @@ router.get('/reports/pnl', ...financeAuth, async (req, res, next) => {
     );
 
     res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── GET /api/v1/finance/invoices ─────────────────────────────────────────────
+router.get('/invoices', ...financeAuth, async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT i.*, t.title AS tour_title
+       FROM invoices i
+       LEFT JOIN tours t ON i.tour_id = t.tour_id
+       ORDER BY i.created_at DESC
+       LIMIT 200`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── GET /api/v1/finance/invoices/:invoiceId ─────────────────────────────────
+router.get('/invoices/:invoiceId', ...financeAuth, async (req, res, next) => {
+  try {
+    const { invoiceId } = req.params;
+    const invoiceResult = await query(`SELECT * FROM invoices WHERE invoice_id = $1`, [invoiceId]);
+    const invoice = invoiceResult.rows[0];
+    if (!invoice) {
+      throw new AppError('Invoice not found', 404);
+    }
+
+    const lines = await query(
+      `SELECT * FROM invoice_lines WHERE invoice_id = $1 ORDER BY line_number ASC`,
+      [invoiceId]
+    );
+
+    res.json({ ...invoice, lines: lines.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/v1/finance/invoices ────────────────────────────────────────────
+router.post('/invoices', ...financeAuth, async (req, res, next) => {
+  try {
+    const { tour_id, description, due_date, currency = 'USD', lines } = req.body;
+    if (!tour_id || !Array.isArray(lines) || lines.length < 2) {
+      throw new AppError('Invoice creation requires tour_id and at least 2 line items', 400);
+    }
+
+    const tourResult = await query(`SELECT * FROM tours WHERE tour_id = $1`, [tour_id]);
+    if (tourResult.rows.length === 0) {
+      throw new AppError('Tour not found', 404);
+    }
+
+    const total = lines.reduce((sum, item) => sum + parseFloat(item.amount || 0), 0);
+    if (total <= 0) {
+      throw new AppError('Invoice total must be greater than zero', 400);
+    }
+
+    const invoiceNumber = `INV-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(Math.random() * 9000 + 1000)}`;
+
+    const invoice = await withTransaction(async (client) => {
+      const invoiceResult = await client.query(
+        `INSERT INTO invoices
+           (invoice_id, invoice_number, tour_id, description, due_date, currency, total_amount, status, created_by)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'issued', $7)
+         RETURNING *`,
+        [invoiceNumber, tour_id, description || 'Tour invoice', due_date, currency, total, req.user.userId]
+      );
+
+      const inserted = invoiceResult.rows[0];
+      let lineNumber = 1;
+      for (const line of lines) {
+        await client.query(
+          `INSERT INTO invoice_lines
+             (invoice_id, line_number, description, account_id, quantity, amount, currency)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [inserted.invoice_id, lineNumber++, line.description, line.account_id, line.quantity || 1, parseFloat(line.amount), currency]
+        );
+      }
+
+      return inserted;
+    });
+
+    await publishEvent('invoice.issued', { invoice_id: invoice.invoice_id, tour_id, created_by: req.user.userId });
+    res.status(201).json(invoice);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/v1/finance/invoices/from-tour ───────────────────────────────────
+router.post('/invoices/from-tour', ...financeAuth, async (req, res, next) => {
+  try {
+    const { tour_id, markup_percent = 20, due_date } = req.body;
+    if (!tour_id) {
+      throw new AppError('tour_id is required to generate an invoice from a tour', 400);
+    }
+
+    const tourResult = await query(`SELECT * FROM tours WHERE tour_id = $1`, [tour_id]);
+    const tour = tourResult.rows[0];
+    if (!tour) {
+      throw new AppError('Tour not found', 404);
+    }
+
+    const bookings = (await query(`SELECT * FROM tour_bookings WHERE tour_id = $1`, [tour_id])).rows;
+    if (bookings.length === 0) {
+      throw new AppError('No bookings exist for this tour yet', 422);
+    }
+
+    const totalCost = bookings.reduce((sum, booking) => sum + parseFloat(booking.cost || 0), 0);
+    const revenue = parseFloat((totalCost * (1 + markup_percent / 100)).toFixed(2));
+
+    const accounts = await query(
+      `SELECT account_id, code FROM ledger_accounts WHERE code IN ('1100','4000')`
+    );
+    const arAccount = accounts.rows.find((acct) => acct.code === '1100');
+    const revenueAccount = accounts.rows.find((acct) => acct.code === '4000');
+    if (!arAccount || !revenueAccount) {
+      throw new AppError('Required ledger accounts are missing (1100, 4000)', 500);
+    }
+
+    const invoiceNumber = `INV-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(Math.random() * 9000 + 1000)}`;
+
+    const invoice = await withTransaction(async (client) => {
+      const invoiceResult = await client.query(
+        `INSERT INTO invoices
+           (invoice_id, invoice_number, tour_id, description, due_date, currency, total_amount, status, created_by)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'issued', $7)
+         RETURNING *`,
+        [invoiceNumber, tour_id, `Auto-generated tour invoice`, due_date || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), tour.currency || 'USD', revenue, req.user.userId]
+      );
+
+      await client.query(
+        `INSERT INTO invoice_lines
+           (invoice_id, line_number, description, account_id, quantity, amount, currency)
+         VALUES ($1, 1, $2, $3, 1, $4, $5)`,
+        [invoiceResult.rows[0].invoice_id, 'Accounts receivable', arAccount.account_id, revenue, tour.currency || 'USD']
+      );
+      await client.query(
+        `INSERT INTO invoice_lines
+           (invoice_id, line_number, description, account_id, quantity, amount, currency)
+         VALUES ($1, 2, $2, $3, 1, $4, $5)`,
+        [invoiceResult.rows[0].invoice_id, 'Tour revenue', revenueAccount.account_id, revenue, tour.currency || 'USD']
+      );
+
+      return invoiceResult.rows[0];
+    });
+
+    await publishEvent('invoice.issued', { invoice_id: invoice.invoice_id, tour_id, created_by: req.user.userId });
+    res.status(201).json(invoice);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/v1/finance/invoices/:invoiceId/documents ────────────────────────
+router.post('/invoices/:invoiceId/documents', ...financeAuth, async (req, res, next) => {
+  try {
+    const { invoiceId } = req.params;
+    const invoiceResult = await query(`SELECT * FROM invoices WHERE invoice_id = $1`, [invoiceId]);
+    const invoice = invoiceResult.rows[0];
+    if (!invoice) {
+      throw new AppError('Invoice not found', 404);
+    }
+
+    const lines = (await query(`SELECT * FROM invoice_lines WHERE invoice_id = $1 ORDER BY line_number ASC`, [invoiceId])).rows;
+    const document = await documentService.createInvoiceDocumentRecord(invoice.tour_id, invoice, lines, req.user.userId);
+
+    await publishEvent('invoice.document.generated', { invoice_id: invoice.invoice_id, document_id: document.document_id });
+    res.status(201).json(document);
   } catch (err) {
     next(err);
   }
